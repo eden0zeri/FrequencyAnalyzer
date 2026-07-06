@@ -1,11 +1,11 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1000" height="420" viewBox="0 0 1000 420">
 <rect width="100%" height="100%" fill="#f8fafc"/>
-<text x="500.0" y="32.0" font-size="20" font-family="Arial, sans-serif" text-anchor="middle">FFT Spectrum: 260630_0019.wav</text>
-<text x="500.0" y="52.0" font-size="12" font-family="Arial, sans-serif" text-anchor="middle">FFT size 8192, peak 5.86 Hz</text>
+<text x="500.0" y="32.0" font-size="20" font-family="Arial, sans-serif" text-anchor="middle">Average FFT Spectrum: 260630_0019.wav</text>
+<text x="500.0" y="52.0" font-size="12" font-family="Arial, sans-serif" text-anchor="middle">FFT size 8192, peak 17.58 Hz</text>
 <line x1="78" y1="58" x2="78" y2="356" stroke="#334155"/>
 <line x1="78" y1="356" x2="966" y2="356" stroke="#334155"/>
 <text x="500.0" y="408.0" font-size="13" font-family="Arial, sans-serif" text-anchor="middle">Frequency (Hz)</text>
-<text x="22.0" y="207.0" font-size="13" font-family="Arial, sans-serif" text-anchor="middle">Magnitude</text>
+<text x="22.0" y="207.0" font-size="13" font-family="Arial, sans-serif" text-anchor="middle">Mean magnitude</text>
 <line x1="78.0" y1="58" x2="78.0" y2="362" stroke="#cbd5e1"/>
 <text x="78.0" y="380.0" font-size="11" font-family="Arial, sans-serif" text-anchor="middle">0</text>
 <line x1="72" y1="356.0" x2="966" y2="356.0" stroke="#cbd5e1"/>
@@ -13,22 +13,22 @@
 <line x1="255.6" y1="58" x2="255.6" y2="362" stroke="#cbd5e1"/>
 <text x="255.6" y="380.0" font-size="11" font-family="Arial, sans-serif" text-anchor="middle">80</text>
 <line x1="72" y1="296.4" x2="966" y2="296.4" stroke="#cbd5e1"/>
-<text x="66.0" y="300.4" font-size="11" font-family="Arial, sans-serif" text-anchor="end">4.5</text>
+<text x="66.0" y="300.4" font-size="11" font-family="Arial, sans-serif" text-anchor="end">3.6</text>
 <line x1="433.2" y1="58" x2="433.2" y2="362" stroke="#cbd5e1"/>
 <text x="433.2" y="380.0" font-size="11" font-family="Arial, sans-serif" text-anchor="middle">160</text>
 <line x1="72" y1="236.8" x2="966" y2="236.8" stroke="#cbd5e1"/>
-<text x="66.0" y="240.8" font-size="11" font-family="Arial, sans-serif" text-anchor="end">9.1</text>
+<text x="66.0" y="240.8" font-size="11" font-family="Arial, sans-serif" text-anchor="end">7.1</text>
 <line x1="610.8" y1="58" x2="610.8" y2="362" stroke="#cbd5e1"/>
 <text x="610.8" y="380.0" font-size="11" font-family="Arial, sans-serif" text-anchor="middle">240</text>
 <line x1="72" y1="177.2" x2="966" y2="177.2" stroke="#cbd5e1"/>
-<text x="66.0" y="181.2" font-size="11" font-family="Arial, sans-serif" text-anchor="end">13.6</text>
+<text x="66.0" y="181.2" font-size="11" font-family="Arial, sans-serif" text-anchor="end">10.7</text>
 <line x1="788.4" y1="58" x2="788.4" y2="362" stroke="#cbd5e1"/>
 <text x="788.4" y="380.0" font-size="11" font-family="Arial, sans-serif" text-anchor="middle">320</text>
 <line x1="72" y1="117.6" x2="966" y2="117.6" stroke="#cbd5e1"/>
-<text x="66.0" y="121.6" font-size="11" font-family="Arial, sans-serif" text-anchor="end">18.2</text>
+<text x="66.0" y="121.6" font-size="11" font-family="Arial, sans-serif" text-anchor="end">14.3</text>
 <line x1="966.0" y1="58" x2="966.0" y2="362" stroke="#cbd5e1"/>
 <text x="966.0" y="380.0" font-size="11" font-family="Arial, sans-serif" text-anchor="middle">400</text>
 <line x1="72" y1="58.0" x2="966" y2="58.0" stroke="#cbd5e1"/>
-<text x="66.0" y="62.0" font-size="11" font-family="Arial, sans-serif" text-anchor="end">22.7</text>
-<polyline points="78.0,58.0 91.0,124.5 104.0,323.9 117.0,138.6 130.0,181.3 143.0,164.0 156.0,166.9 169.1,295.6 182.1,217.3 195.1,308.3 208.1,255.2 221.1,247.2 234.1,230.7 247.1,247.6 260.1,287.8 273.1,278.5 286.1,338.5 299.1,318.0 312.1,333.0 325.1,334.9 338.2,322.7 351.2,321.3 364.2,321.2 377.2,298.4 390.2,265.7 403.2,289.3 416.2,309.1 429.2,332.7 442.2,348.4 455.2,335.9 468.2,318.2 481.2,326.2 494.2,338.0 507.3,345.5 520.3,345.8 533.3,339.0 546.3,337.5 559.3,333.0 572.3,335.0 585.3,343.7 598.3,346.8 611.3,350.2 624.3,335.7 637.3,342.2 650.3,343.1 663.4,346.1 676.4,353.6 689.4,341.9 702.4,344.6 715.4,349.6 728.4,349.6 741.4,353.8 754.4,351.7 767.4,351.0 780.4,350.9 793.4,351.2 806.4,352.6 819.4,353.7 832.5,351.9 845.5,351.3 858.5,349.9 871.5,351.5 884.5,351.1 897.5,343.8 910.5,342.0 923.5,342.6 936.5,346.9 949.5,354.6 962.5,352.6" fill="none" stroke="#0f766e" stroke-width="1.5"/>
+<text x="66.0" y="62.0" font-size="11" font-family="Arial, sans-serif" text-anchor="end">17.8</text>
+<polyline points="78.0,95.4 91.0,152.1 104.0,185.4 117.0,58.0 130.0,63.3 143.0,151.0 156.0,170.9 169.1,204.8 182.1,202.5 195.1,228.7 208.1,248.6 221.1,252.7 234.1,274.9 247.1,290.4 260.1,290.2 273.1,288.1 286.1,301.2 299.1,302.1 312.1,303.2 325.1,313.3 338.2,314.1 351.2,317.7 364.2,304.6 377.2,189.4 390.2,166.4 403.2,285.8 416.2,315.3 429.2,324.6 442.2,324.1 455.2,322.7 468.2,326.9 481.2,329.0 494.2,324.4 507.3,318.7 520.3,318.6 533.3,316.8 546.3,327.7 559.3,334.5 572.3,332.0 585.3,333.4 598.3,336.7 611.3,336.7 624.3,335.0 637.3,336.0 650.3,338.3 663.4,341.3 676.4,339.3 689.4,336.2 702.4,341.4 715.4,344.3 728.4,339.6 741.4,342.0 754.4,345.0 767.4,344.8 780.4,344.6 793.4,345.2 806.4,345.5 819.4,345.5 832.5,344.3 845.5,342.9 858.5,343.7 871.5,344.7 884.5,344.6 897.5,343.7 910.5,341.6 923.5,340.6 936.5,342.5 949.5,343.7 962.5,342.9" fill="none" stroke="#0f766e" stroke-width="1.5"/>
 </svg>

@@ -2,6 +2,7 @@ source_file,260630_0020.wav
 sample_rate_hz,48000
 fft_size,8192
 dominant_frequency_hz,5.859375
+note,first-window FFT only; dominant_frequencies.csv uses full-file average spectrum
 
 frequency_hz,magnitude
 0.000000,204.961535256921

@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="420" viewBox="0 0 1000 420">
+<rect width="100%" height="100%" fill="#f8fafc"/>
+<text x="500.0" y="32.0" font-size="20" font-family="Arial, sans-serif" text-anchor="middle">Dominant Frequency Over Time: 260630_0020.wav</text>
+<line x1="78" y1="58" x2="78" y2="356" stroke="#334155"/>
+<line x1="78" y1="356" x2="966" y2="356" stroke="#334155"/>
+<text x="500.0" y="408.0" font-size="13" font-family="Arial, sans-serif" text-anchor="middle">Time (seconds)</text>
+<text x="22.0" y="207.0" font-size="13" font-family="Arial, sans-serif" text-anchor="middle">Hz</text>
+<line x1="78.0" y1="58" x2="78.0" y2="362" stroke="#cbd5e1"/>
+<text x="78.0" y="380.0" font-size="11" font-family="Arial, sans-serif" text-anchor="middle">0.0</text>
+<line x1="72" y1="356.0" x2="966" y2="356.0" stroke="#cbd5e1"/>
+<text x="66.0" y="360.0" font-size="11" font-family="Arial, sans-serif" text-anchor="end">0</text>
+<line x1="255.6" y1="58" x2="255.6" y2="362" stroke="#cbd5e1"/>
+<text x="255.6" y="380.0" font-size="11" font-family="Arial, sans-serif" text-anchor="middle">0.2</text>
+<line x1="72" y1="296.4" x2="966" y2="296.4" stroke="#cbd5e1"/>
+<text x="66.0" y="300.4" font-size="11" font-family="Arial, sans-serif" text-anchor="end">20</text>
+<line x1="433.2" y1="58" x2="433.2" y2="362" stroke="#cbd5e1"/>
+<text x="433.2" y="380.0" font-size="11" font-family="Arial, sans-serif" text-anchor="middle">0.4</text>
+<line x1="72" y1="236.8" x2="966" y2="236.8" stroke="#cbd5e1"/>
+<text x="66.0" y="240.8" font-size="11" font-family="Arial, sans-serif" text-anchor="end">40</text>
+<line x1="610.8" y1="58" x2="610.8" y2="362" stroke="#cbd5e1"/>
+<text x="610.8" y="380.0" font-size="11" font-family="Arial, sans-serif" text-anchor="middle">0.6</text>
+<line x1="72" y1="177.2" x2="966" y2="177.2" stroke="#cbd5e1"/>
+<text x="66.0" y="181.2" font-size="11" font-family="Arial, sans-serif" text-anchor="end">60</text>
+<line x1="788.4" y1="58" x2="788.4" y2="362" stroke="#cbd5e1"/>
+<text x="788.4" y="380.0" font-size="11" font-family="Arial, sans-serif" text-anchor="middle">0.7</text>
+<line x1="72" y1="117.6" x2="966" y2="117.6" stroke="#cbd5e1"/>
+<text x="66.0" y="121.6" font-size="11" font-family="Arial, sans-serif" text-anchor="end">80</text>
+<line x1="966.0" y1="58" x2="966.0" y2="362" stroke="#cbd5e1"/>
+<text x="966.0" y="380.0" font-size="11" font-family="Arial, sans-serif" text-anchor="middle">0.9</text>
+<line x1="72" y1="58.0" x2="966" y2="58.0" stroke="#cbd5e1"/>
+<text x="66.0" y="62.0" font-size="11" font-family="Arial, sans-serif" text-anchor="end">100</text>
+<polyline points="160.1,286.2 242.3,233.8 324.4,251.2 406.5,268.7 488.6,216.3 570.8,251.2 652.9,286.2 735.0,111.5 817.1,233.8 899.3,251.2 966.0,111.5" fill="none" stroke="#7c3aed" stroke-width="1.5"/>
+</svg>
