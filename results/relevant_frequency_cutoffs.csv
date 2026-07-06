@@ -1,0 +1,6 @@
+file,relevant_max_frequency_hz,method,minimum_hz,threshold_fraction,search_max_hz
+260630_0016.wav,400.000000,smoothed magnitude threshold with minimum cutoff,400.000000,0.100000,2000.000000
+260630_0017.wav,544.921875,smoothed magnitude threshold with minimum cutoff,400.000000,0.100000,2000.000000
+260630_0018.wav,802.734375,smoothed magnitude threshold with minimum cutoff,400.000000,0.100000,2000.000000
+260630_0019.wav,400.000000,smoothed magnitude threshold with minimum cutoff,400.000000,0.100000,2000.000000
+260630_0020.wav,400.000000,smoothed magnitude threshold with minimum cutoff,400.000000,0.100000,2000.000000

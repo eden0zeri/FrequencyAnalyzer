@@ -1,0 +1,11 @@
+source_file,mode,kept_frequency_hz,relevant_max_frequency_hz,output_wav
+260630_0016.wav,full,41.015625,,results/filtered_full/wav/260630_0016_full_dominant_only.wav
+260630_0016.wav,relevant,41.015625,400.000000,results/filtered_relevant/wav/260630_0016_relevant_dominant_only.wav
+260630_0017.wav,full,41.015625,,results/filtered_full/wav/260630_0017_full_dominant_only.wav
+260630_0017.wav,relevant,41.015625,544.921875,results/filtered_relevant/wav/260630_0017_relevant_dominant_only.wav
+260630_0018.wav,full,351.562500,,results/filtered_full/wav/260630_0018_full_dominant_only.wav
+260630_0018.wav,relevant,351.562500,802.734375,results/filtered_relevant/wav/260630_0018_relevant_dominant_only.wav
+260630_0019.wav,full,5.859375,,results/filtered_full/wav/260630_0019_full_dominant_only.wav
+260630_0019.wav,relevant,5.859375,400.000000,results/filtered_relevant/wav/260630_0019_relevant_dominant_only.wav
+260630_0020.wav,full,5.859375,,results/filtered_full/wav/260630_0020_full_dominant_only.wav
+260630_0020.wav,relevant,5.859375,400.000000,results/filtered_relevant/wav/260630_0020_relevant_dominant_only.wav

@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="420" viewBox="0 0 1000 420">
+<rect width="100%" height="100%" fill="#f8fafc"/>
+<text x="500.0" y="32.0" font-size="20" font-family="Arial, sans-serif" text-anchor="middle">FFT Spectrum: 260630_0018.wav</text>
+<text x="500.0" y="52.0" font-size="12" font-family="Arial, sans-serif" text-anchor="middle">FFT size 8192, peak 351.56 Hz</text>
+<line x1="78" y1="58" x2="78" y2="356" stroke="#334155"/>
+<line x1="78" y1="356" x2="966" y2="356" stroke="#334155"/>
+<text x="500.0" y="408.0" font-size="13" font-family="Arial, sans-serif" text-anchor="middle">Frequency (Hz)</text>
+<text x="22.0" y="207.0" font-size="13" font-family="Arial, sans-serif" text-anchor="middle">Magnitude</text>
+<line x1="78.0" y1="58" x2="78.0" y2="362" stroke="#cbd5e1"/>
+<text x="78.0" y="380.0" font-size="11" font-family="Arial, sans-serif" text-anchor="middle">0</text>
+<line x1="72" y1="356.0" x2="966" y2="356.0" stroke="#cbd5e1"/>
+<text x="66.0" y="360.0" font-size="11" font-family="Arial, sans-serif" text-anchor="end">0.0</text>
+<line x1="255.6" y1="58" x2="255.6" y2="362" stroke="#cbd5e1"/>
+<text x="255.6" y="380.0" font-size="11" font-family="Arial, sans-serif" text-anchor="middle">161</text>
+<line x1="72" y1="296.4" x2="966" y2="296.4" stroke="#cbd5e1"/>
+<text x="66.0" y="300.4" font-size="11" font-family="Arial, sans-serif" text-anchor="end">7.5</text>
+<line x1="433.2" y1="58" x2="433.2" y2="362" stroke="#cbd5e1"/>
+<text x="433.2" y="380.0" font-size="11" font-family="Arial, sans-serif" text-anchor="middle">321</text>
+<line x1="72" y1="236.8" x2="966" y2="236.8" stroke="#cbd5e1"/>
+<text x="66.0" y="240.8" font-size="11" font-family="Arial, sans-serif" text-anchor="end">15.1</text>
+<line x1="610.8" y1="58" x2="610.8" y2="362" stroke="#cbd5e1"/>
+<text x="610.8" y="380.0" font-size="11" font-family="Arial, sans-serif" text-anchor="middle">482</text>
+<line x1="72" y1="177.2" x2="966" y2="177.2" stroke="#cbd5e1"/>
+<text x="66.0" y="181.2" font-size="11" font-family="Arial, sans-serif" text-anchor="end">22.6</text>
+<line x1="788.4" y1="58" x2="788.4" y2="362" stroke="#cbd5e1"/>
+<text x="788.4" y="380.0" font-size="11" font-family="Arial, sans-serif" text-anchor="middle">642</text>
+<line x1="72" y1="117.6" x2="966" y2="117.6" stroke="#cbd5e1"/>
+<text x="66.0" y="121.6" font-size="11" font-family="Arial, sans-serif" text-anchor="end">30.1</text>
+<line x1="966.0" y1="58" x2="966.0" y2="362" stroke="#cbd5e1"/>
+<text x="966.0" y="380.0" font-size="11" font-family="Arial, sans-serif" text-anchor="middle">803</text>
+<line x1="72" y1="58.0" x2="966" y2="58.0" stroke="#cbd5e1"/>
+<text x="66.0" y="62.0" font-size="11" font-family="Arial, sans-serif" text-anchor="end">37.7</text>
+<polyline points="78.0,295.5 84.5,318.6 91.0,298.9 97.4,340.2 103.9,332.3 110.4,311.3 116.9,251.3 123.4,248.9 129.9,252.1 136.3,211.0 142.8,281.1 149.3,298.3 155.8,318.9 162.3,324.6 168.7,313.5 175.2,319.1 181.7,315.1 188.2,295.1 194.7,296.0 201.2,301.3 207.6,313.6 214.1,315.3 220.6,323.4 227.1,290.5 233.6,185.1 240.0,126.5 246.5,209.0 253.0,209.1 259.5,237.9 266.0,212.6 272.5,153.5 278.9,272.4 285.4,129.9 291.9,194.4 298.4,249.7 304.9,188.9 311.3,198.1 317.8,266.7 324.3,266.2 330.8,267.1 337.3,257.1 343.8,309.8 350.2,273.0 356.7,214.2 363.2,289.2 369.7,311.7 376.2,265.0 382.6,283.9 389.1,332.4 395.6,347.1 402.1,340.8 408.6,326.8 415.1,328.9 421.5,328.8 428.0,307.8 434.5,309.7 441.0,331.4 447.5,268.2 453.9,173.4 460.4,175.2 466.9,58.0 473.4,96.7 479.9,182.2 486.4,261.0 492.8,315.9 499.3,290.6 505.8,266.5 512.3,307.4 518.8,315.4 525.2,315.1 531.7,299.5 538.2,281.4 544.7,299.1 551.2,333.6 557.6,339.3 564.1,350.2 570.6,351.4 577.1,347.4 583.6,331.2 590.1,335.2 596.5,339.4 603.0,340.3 609.5,341.6 616.0,332.6 622.5,345.2 628.9,354.1 635.4,337.5 641.9,329.0 648.4,337.9 654.9,319.7 661.4,339.5 667.8,336.1 674.3,346.6 680.8,315.0 687.3,311.6 693.8,347.1 700.2,324.8 706.7,312.4 713.2,295.5 719.7,326.3 726.2,335.3 732.7,347.4 739.1,339.0 745.6,343.1 752.1,326.0 758.6,288.8 765.1,286.6 771.5,336.3 778.0,315.4 784.5,290.3 791.0,258.0 797.5,289.1 804.0,329.4 810.4,313.5 816.9,311.7 823.4,339.6 829.9,344.7 836.4,330.7 842.8,344.4 849.3,332.7 855.8,348.9 862.3,320.0 868.8,348.8 875.3,340.0 881.7,349.5 888.2,344.4 894.7,341.8 901.2,336.9 907.7,344.8 914.1,343.5 920.6,343.3 927.1,345.4 933.6,321.9 940.1,324.2 946.6,323.6 953.0,336.8 959.5,342.7 966.0,336.6" fill="none" stroke="#0f766e" stroke-width="1.5"/>
+</svg>
