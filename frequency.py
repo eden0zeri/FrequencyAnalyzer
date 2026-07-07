@@ -14,6 +14,9 @@ import wave
 from pathlib import Path
 from xml.sax.saxutils import escape
 
+import numpy as np
+from scipy.signal import stft
+
 
 DEFAULT_DATA_DIR = Path("Data")
 DEFAULT_RESULTS_DIR = Path("outputs")
@@ -34,7 +37,7 @@ SILENCE_MAGNITUDE = 1e-9
 
 
 def fft(values: list[complex]) -> list[complex]:
-    """Radix-2 Cooley-Tukey Fast Fourier Transform."""
+    """Educational reference FFT. Active analysis uses numpy.fft.rfft."""
     n = len(values)
     if n <= 1:
         return values
@@ -221,7 +224,7 @@ def frequency_bin_range(
     max_frequency_hz: float | None,
 ) -> range:
     min_bin = max(1, math.ceil(min_frequency_hz * fft_size / sample_rate))
-    max_bin = fft_size // 2 - 1
+    max_bin = fft_size // 2
     if max_frequency_hz is not None:
         max_bin = min(max_bin, math.floor(max_frequency_hz * fft_size / sample_rate))
     if max_bin < min_bin:
@@ -234,7 +237,7 @@ def fft_bins_from_samples(
     sample_rate: int,
     fft_size: int,
 ) -> list[tuple[float, float]]:
-    """First-window FFT, kept for backwards-compatible raw FFT CSV output."""
+    """First-window real FFT using numpy.fft.rfft."""
     actual_fft_size = min(fft_size, power_of_two_at_most(len(samples)))
     if actual_fft_size < 2:
         return []
@@ -243,11 +246,12 @@ def fft_bins_from_samples(
     if len(block) < actual_fft_size:
         block = block + [0.0] * (actual_fft_size - len(block))
 
-    window = hann_window(actual_fft_size)
-    spectrum = fft([sample * window[index] for index, sample in enumerate(block)])
+    windowed = np.asarray(block, dtype=float) * np.hanning(actual_fft_size)
+    spectrum = np.fft.rfft(windowed)
+    frequencies = np.fft.rfftfreq(actual_fft_size, d=1 / sample_rate)
     return [
-        (bin_index * sample_rate / actual_fft_size, abs(spectrum[bin_index]))
-        for bin_index in range(actual_fft_size // 2)
+        (float(frequency), float(magnitude))
+        for frequency, magnitude in zip(frequencies, np.abs(spectrum))
     ]
 
 
@@ -297,14 +301,15 @@ def analyze_samples_over_time(
     hop_size = max(1, min(hop_size, actual_fft_size))
 
     starts = frame_starts(len(samples), actual_fft_size, hop_size)
-    window = hann_window(actual_fft_size)
+    window = np.hanning(actual_fft_size)
     bin_range = frequency_bin_range(
         sample_rate,
         actual_fft_size,
         min_frequency_hz,
         max_frequency_hz,
     )
-    magnitude_sums = [0.0] * (actual_fft_size // 2)
+    frequencies = np.fft.rfftfreq(actual_fft_size, d=1 / sample_rate)
+    magnitude_sums = np.zeros(len(frequencies), dtype=float)
     frames: list[dict[str, float]] = []
 
     for start in starts:
@@ -312,15 +317,18 @@ def analyze_samples_over_time(
         if len(block) < actual_fft_size:
             block = block + [0.0] * (actual_fft_size - len(block))
 
-        spectrum = fft([sample * window[index] for index, sample in enumerate(block)])
+        spectrum = np.fft.rfft(np.asarray(block, dtype=float) * window)
+        magnitudes = np.abs(spectrum)
+        magnitude_sums += magnitudes
         frame_best_frequency = 0.0
         frame_best_magnitude = 0.0
 
-        for bin_index in range(actual_fft_size // 2):
-            magnitude = abs(spectrum[bin_index])
-            magnitude_sums[bin_index] += magnitude
+        for bin_index in bin_range:
+            if bin_index >= len(magnitudes):
+                continue
+            magnitude = float(magnitudes[bin_index])
             if bin_index in bin_range and magnitude > frame_best_magnitude:
-                frame_best_frequency = bin_index * sample_rate / actual_fft_size
+                frame_best_frequency = float(frequencies[bin_index])
                 frame_best_magnitude = magnitude
 
         frames.append(
@@ -333,8 +341,8 @@ def analyze_samples_over_time(
 
     frames_analyzed = max(1, len(starts))
     average_spectrum = [
-        (bin_index * sample_rate / actual_fft_size, magnitude / frames_analyzed)
-        for bin_index, magnitude in enumerate(magnitude_sums)
+        (float(frequency), float(magnitude / frames_analyzed))
+        for frequency, magnitude in zip(frequencies, magnitude_sums)
     ]
     candidate_bins = [
         (frequency, magnitude)
@@ -1126,30 +1134,42 @@ def spectrogram_cells_from_samples(
     actual_fft_size = min(fft_size, power_of_two_at_most(len(samples)))
     if actual_fft_size < 2:
         actual_fft_size = 2
-    hop_size = max(1, actual_fft_size // 2)
-    starts = frame_starts(len(samples), actual_fft_size, hop_size)
-    column_step = max(1, math.ceil(len(starts) / max_columns))
     frequency_limit = min(max_frequency_hz, sample_rate / 2)
-    max_bin = max(1, min(actual_fft_size // 2 - 1, int(frequency_limit * actual_fft_size / sample_rate)))
-    window = hann_window(actual_fft_size)
+    noverlap = actual_fft_size // 2
+    frequencies, _times, spectrum = stft(
+        np.asarray(samples, dtype=float),
+        fs=sample_rate,
+        window="hann",
+        nperseg=actual_fft_size,
+        noverlap=noverlap,
+        nfft=actual_fft_size,
+        boundary=None,
+        padded=True,
+    )
+    magnitudes = np.abs(spectrum)
+    visible_mask = (frequencies > 0) & (frequencies <= frequency_limit)
+    visible_frequencies = frequencies[visible_mask]
+    visible_magnitudes = magnitudes[visible_mask]
+    if visible_magnitudes.size == 0:
+        duration = len(samples) / sample_rate if sample_rate else 0.0
+        return [], duration, frequency_limit, actual_fft_size
+
+    column_count = visible_magnitudes.shape[1]
+    column_step = max(1, math.ceil(column_count / max_columns))
+    band_edges = np.linspace(0.0, frequency_limit, band_count + 1)
     cells: list[list[float]] = []
 
-    for start in starts[::column_step]:
-        block = samples[start : start + actual_fft_size]
-        if len(block) < actual_fft_size:
-            block = block + [0.0] * (actual_fft_size - len(block))
-        spectrum = fft([sample * window[index] for index, sample in enumerate(block)])
+    for column_index in range(0, column_count, column_step):
         column = [0.0] * band_count
-        counts = [0] * band_count
-
-        for bin_index in range(1, max_bin + 1):
-            band_index = min(band_count - 1, int((bin_index - 1) * band_count / max_bin))
-            column[band_index] += abs(spectrum[bin_index])
-            counts[band_index] += 1
-
-        for band_index, count in enumerate(counts):
-            if count:
-                column[band_index] /= count
+        for band_index in range(band_count):
+            low = band_edges[band_index]
+            high = band_edges[band_index + 1]
+            if band_index == band_count - 1:
+                mask = (visible_frequencies >= low) & (visible_frequencies <= high)
+            else:
+                mask = (visible_frequencies >= low) & (visible_frequencies < high)
+            if np.any(mask):
+                column[band_index] = float(np.mean(visible_magnitudes[mask, column_index]))
         cells.append(column)
 
     duration = len(samples) / sample_rate if sample_rate else 0.0

@@ -141,4 +141,4 @@ Resampling affects analysis and plots only; original input WAVs are not modified
 
 ## Dependencies
 
-The analyzer uses its own FFT implementation for core spectra. Resampling and filtering require SciPy. PNG plotting requires Matplotlib.
+The analyzer uses NumPy `numpy.fft.rfft` / `numpy.fft.rfftfreq` for real-valued spectra and SciPy `scipy.signal.stft` for spectrograms. Resampling and filtering also use SciPy signal tools. PNG plotting requires Matplotlib.
