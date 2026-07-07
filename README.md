@@ -25,6 +25,7 @@ Optional Streamlit UI:
 ```bash
 streamlit run streamlit_app.py
 ```
+http://localhost:8501/
 
 ## Denoised vs Isolated Audio
 
