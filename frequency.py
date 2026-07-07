@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
+import os
+import shutil
 import statistics
 import wave
 from pathlib import Path
@@ -13,10 +16,11 @@ from xml.sax.saxutils import escape
 
 
 DEFAULT_DATA_DIR = Path("Data")
-DEFAULT_RESULTS_DIR = Path("results")
+DEFAULT_RESULTS_DIR = Path("outputs")
 FFT_SIZE = 8192
 WAVEFORM_POINTS = 4000
 MAX_SPECTRUM_HZ = 2000.0
+DEFAULT_ANALYSIS_SAMPLE_RATE_HZ = 5000
 RECOMMENDED_MIN_FREQUENCY_HZ = 50.0
 SPECTROGRAM_FFT_SIZE = 2048
 SPECTROGRAM_BANDS = 180
@@ -88,6 +92,77 @@ def read_mono_wav(path: Path) -> tuple[list[float], int, int]:
         raw = wav_file.readframes(wav_file.getnframes())
 
     return decode_pcm_frames(raw, sample_width, channels), sample_rate, channels
+
+
+def resample_samples_polyphase(
+    samples: list[float],
+    original_sample_rate: int,
+    analysis_sample_rate: int,
+) -> list[float]:
+    """Resample audio with scipy's anti-aliased polyphase filter."""
+    if analysis_sample_rate == original_sample_rate:
+        return samples[:]
+    if analysis_sample_rate < 2:
+        raise ValueError("analysis sample rate must be at least 2 Hz")
+
+    try:
+        from scipy.signal import resample_poly
+    except ImportError as exc:
+        raise RuntimeError(
+            "Resampling requires scipy. Install scipy or pass --no-resample."
+        ) from exc
+
+    divisor = math.gcd(original_sample_rate, analysis_sample_rate)
+    up = analysis_sample_rate // divisor
+    down = original_sample_rate // divisor
+    resampled = resample_poly(samples, up, down)
+    return [float(sample) for sample in resampled]
+
+
+def choose_analysis_audio(
+    samples: list[float],
+    original_sample_rate: int,
+    requested_sample_rate: int,
+    resample_enabled: bool,
+    method: str,
+) -> tuple[list[float], int, bool]:
+    if not resample_enabled or requested_sample_rate == original_sample_rate:
+        return samples[:], original_sample_rate, False
+    if method != "polyphase":
+        raise ValueError("Only --resample-method polyphase is currently supported")
+    return (
+        resample_samples_polyphase(samples, original_sample_rate, requested_sample_rate),
+        requested_sample_rate,
+        True,
+    )
+
+
+def clamp_frequency_settings(
+    analysis_sample_rate: int,
+    min_frequency_hz: float,
+    max_frequency_hz: float | None,
+) -> tuple[float, float | None, list[str]]:
+    warnings = []
+    nyquist_hz = analysis_sample_rate / 2
+    if max_frequency_hz is not None and max_frequency_hz > nyquist_hz:
+        warnings.append(
+            f"max_frequency_hz {max_frequency_hz:.1f} is above Nyquist "
+            f"{nyquist_hz:.1f}; clamped to {nyquist_hz:.1f} Hz."
+        )
+        max_frequency_hz = nyquist_hz
+    if max_frequency_hz is not None and analysis_sample_rate < 2.5 * max_frequency_hz:
+        warnings.append(
+            f"analysis sample rate {analysis_sample_rate} Hz is low for "
+            f"max_frequency_hz {max_frequency_hz:.1f}; consider at least "
+            f"{math.ceil(2.5 * max_frequency_hz)} Hz."
+        )
+    if min_frequency_hz >= nyquist_hz:
+        warnings.append(
+            f"min_frequency_hz {min_frequency_hz:.1f} is at or above Nyquist; "
+            "lowering it to keep at least one analyzable bin."
+        )
+        min_frequency_hz = max(0.0, nyquist_hz / 10)
+    return min_frequency_hz, max_frequency_hz, warnings
 
 
 def write_wav_from_mono(
@@ -191,6 +266,29 @@ def analyze_dominant_frequency_over_time(
     frequency is the bin with the largest mean magnitude.
     """
     samples, sample_rate, channels = read_mono_wav(wav_path)
+    return analyze_samples_over_time(
+        wav_path.name,
+        samples,
+        sample_rate,
+        channels,
+        fft_size,
+        hop_size,
+        min_frequency_hz,
+        max_frequency_hz,
+    )
+
+
+def analyze_samples_over_time(
+    name: str,
+    samples: list[float],
+    sample_rate: int,
+    channels: int,
+    fft_size: int,
+    hop_size: int | None = None,
+    min_frequency_hz: float = 20.0,
+    max_frequency_hz: float | None = None,
+) -> dict[str, object]:
+    """Analyze dominant frequencies across a sample array."""
     duration = len(samples) / sample_rate if sample_rate else 0.0
     actual_fft_size = min(fft_size, power_of_two_at_most(len(samples)))
     if actual_fft_size < 2:
@@ -252,7 +350,7 @@ def analyze_dominant_frequency_over_time(
     strongest_frame = max(frames, key=lambda frame: frame["dominant_magnitude"], default={})
 
     return {
-        "file": wav_path.name,
+        "file": name,
         "sample_rate_hz": sample_rate,
         "channels": channels,
         "duration_seconds": duration,
@@ -429,13 +527,13 @@ def audit_row(
         warnings.append("no strong frequency detected")
         recommendations.append("Check whether the source audio is silent or extremely low level.")
     if filtered:
-        warnings.append("filtered dominant-only file should show a narrow horizontal band")
+        warnings.append("dominant-sine debug file should show a narrow horizontal band")
         useful_span = useful_max - float(useful_range["useful_min_frequency_hz"])
         if useful_span > max(200.0, dominant_frequency_hz):
             warnings.append("filtered energy spread wider than expected")
             recommendations.append("Filtered output may not be isolating a single tone cleanly.")
         else:
-            recommendations.append("Sparse spectrogram is expected for dominant-only filtered audio.")
+            recommendations.append("Sparse spectrogram is expected for dominant-sine debug audio.")
 
     return {
         "source_file": source_file,
@@ -517,6 +615,55 @@ def filter_to_single_frequency(
             output[index] /= weight
 
     return output
+
+
+def filter_frequency_band(
+    samples: list[float],
+    sample_rate: int,
+    low_cutoff_hz: float | None,
+    high_cutoff_hz: float | None,
+    notch_frequency_hz: float = 0.0,
+    notch_harmonics: int = 0,
+) -> list[float]:
+    """Preserve a frequency band while suppressing low hum/rumble."""
+    if not samples:
+        return []
+
+    try:
+        from scipy.signal import butter, filtfilt, iirnotch, sosfilt, sosfiltfilt
+    except ImportError as exc:
+        raise RuntimeError("Band filtering requires scipy.") from exc
+
+    nyquist_hz = sample_rate / 2
+    low = low_cutoff_hz if low_cutoff_hz and low_cutoff_hz > 0 else None
+    high = high_cutoff_hz if high_cutoff_hz and high_cutoff_hz < nyquist_hz else None
+    filtered = samples[:]
+
+    if low is not None and high is not None and low >= high:
+        raise ValueError("Band filter low cutoff must be lower than high cutoff")
+
+    if low is not None or high is not None:
+        if low is not None and high is not None:
+            wn: float | list[float] = [low / nyquist_hz, high / nyquist_hz]
+            btype = "bandpass"
+        elif low is not None:
+            wn = low / nyquist_hz
+            btype = "highpass"
+        else:
+            wn = high / nyquist_hz  # type: ignore[operator]
+            btype = "lowpass"
+        sos = butter(6, wn, btype=btype, output="sos")
+        filtered = list(sosfiltfilt(sos, filtered) if len(filtered) > 64 else sosfilt(sos, filtered))
+
+    if notch_frequency_hz > 0 and notch_harmonics > 0:
+        for harmonic in range(1, notch_harmonics + 1):
+            frequency_hz = notch_frequency_hz * harmonic
+            if frequency_hz >= nyquist_hz:
+                break
+            b, a = iirnotch(frequency_hz / nyquist_hz, 30)
+            filtered = list(filtfilt(b, a, filtered) if len(filtered) > 64 else filtered)
+
+    return [float(sample) for sample in filtered]
 
 
 def svg_text(x: float, y: float, text: str, size: int = 12, anchor: str = "middle") -> str:
@@ -656,6 +803,298 @@ def write_spectrum_svg_from_bins(
     output_path.write_text("\n".join(elements))
 
 
+def write_db_spectrum_svg_from_bins(
+    title: str,
+    bins: list[tuple[float, float]],
+    fft_size: int,
+    output_path: Path,
+    max_spectrum_hz: float = MAX_SPECTRUM_HZ,
+    subtitle: str = "",
+) -> None:
+    db_bins = [
+        (frequency, 20 * math.log10(max(magnitude, 1e-12)))
+        for frequency, magnitude in bins
+    ]
+    frequency_limit = max(1.0, max_spectrum_hz)
+    visible_bins = [item for item in db_bins if item[0] <= frequency_limit]
+    min_db = min((magnitude for _, magnitude in visible_bins), default=-120.0)
+    max_db = max((magnitude for _, magnitude in visible_bins), default=0.0)
+    if max_db - min_db < 1:
+        min_db = max_db - 1
+    width = 1000
+    height = 420
+    left = 112
+    right = 34
+    top = 58
+    bottom = 64
+    plot_width = width - left - right
+    plot_height = height - top - bottom
+    elements = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="#f8fafc"/>',
+        svg_text(width / 2, 32, f"Average FFT Spectrum dB: {title}", 20),
+        svg_text(
+            width / 2,
+            52,
+            f"FFT size {fft_size}, range 0-{frequency_limit:.0f} Hz{(' - ' + subtitle) if subtitle else ''}",
+            12,
+        ),
+        f'<line x1="{left}" y1="{top}" x2="{left}" y2="{height - bottom}" stroke="#334155"/>',
+        f'<line x1="{left}" y1="{height - bottom}" x2="{width - right}" y2="{height - bottom}" stroke="#334155"/>',
+        svg_text(width / 2, height - 12, "Frequency (Hz)", 13),
+        svg_text(32, top + plot_height / 2, "dB magnitude", 13),
+    ]
+
+    for tick in range(6):
+        frequency = frequency_limit * tick / 5
+        db_value = min_db + (max_db - min_db) * tick / 5
+        x = left + (frequency / frequency_limit) * plot_width
+        y = top + plot_height - ((db_value - min_db) / (max_db - min_db)) * plot_height
+        elements.append(f'<line x1="{x:.1f}" y1="{top}" x2="{x:.1f}" y2="{height - bottom + 6}" stroke="#cbd5e1"/>')
+        elements.append(svg_text(x, height - bottom + 24, f"{frequency:.0f}", 11))
+        elements.append(f'<line x1="{left - 6}" y1="{y:.1f}" x2="{width - right}" y2="{y:.1f}" stroke="#cbd5e1"/>')
+        elements.append(svg_text(left - 12, y + 4, f"{db_value:.1f}", 11, "end"))
+
+    points = []
+    for frequency, db_value in visible_bins:
+        x = left + (frequency / frequency_limit) * plot_width
+        y = top + plot_height - ((db_value - min_db) / (max_db - min_db)) * plot_height
+        points.append(f"{x:.1f},{y:.1f}")
+    if points:
+        elements.append(f'<polyline points="{" ".join(points)}" fill="none" stroke="#be123c" stroke-width="1.5"/>')
+
+    elements.append("</svg>")
+    output_path.write_text("\n".join(elements))
+
+
+def write_spectrum_variability_svg(
+    title: str,
+    frequency_bins: list[float],
+    center_values: list[float],
+    low_values: list[float],
+    high_values: list[float],
+    output_path: Path,
+    max_spectrum_hz: float,
+    subtitle: str = "",
+) -> None:
+    triples = [
+        (frequency, center, low, high)
+        for frequency, center, low, high in zip(frequency_bins, center_values, low_values, high_values)
+        if frequency <= max_spectrum_hz
+    ]
+    if not triples:
+        triples = [(0.0, 0.0, 0.0, 0.0)]
+    max_magnitude = max((high for _, _, _, high in triples), default=1.0)
+    max_magnitude = max(max_magnitude, 1e-12)
+    width = 1000
+    height = 420
+    left = 112
+    right = 34
+    top = 58
+    bottom = 64
+    plot_width = width - left - right
+    plot_height = height - top - bottom
+    frequency_limit = max(1.0, max_spectrum_hz)
+    elements = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="#f8fafc"/>',
+        svg_text(width / 2, 32, f"Segment Spectrum Variability: {title}", 20),
+        svg_text(width / 2, 52, f"Numerical segment spectra averaged; range 0-{frequency_limit:.0f} Hz{(' - ' + subtitle) if subtitle else ''}", 12),
+        f'<line x1="{left}" y1="{top}" x2="{left}" y2="{height - bottom}" stroke="#334155"/>',
+        f'<line x1="{left}" y1="{height - bottom}" x2="{width - right}" y2="{height - bottom}" stroke="#334155"/>',
+        svg_text(width / 2, height - 12, "Frequency (Hz)", 13),
+        svg_text(32, top + plot_height / 2, "Mean magnitude", 13),
+    ]
+    upper = []
+    lower = []
+    center = []
+    for frequency, center_value, low, high in triples:
+        x = left + (frequency / frequency_limit) * plot_width
+        upper.append(f"{x:.1f},{top + plot_height - (high / max_magnitude) * plot_height:.1f}")
+        lower.append(f"{x:.1f},{top + plot_height - (low / max_magnitude) * plot_height:.1f}")
+        center.append(f"{x:.1f},{top + plot_height - (center_value / max_magnitude) * plot_height:.1f}")
+    if upper and lower:
+        elements.append(f'<polygon points="{" ".join(upper + list(reversed(lower)))}" fill="#99f6e4" opacity="0.65"/>')
+    if center:
+        elements.append(f'<polyline points="{" ".join(center)}" fill="none" stroke="#0f766e" stroke-width="1.6"/>')
+    elements.append("</svg>")
+    output_path.write_text("\n".join(elements))
+
+
+def pyplot_module():
+    os.environ.setdefault("MPLCONFIGDIR", str(Path("/private/tmp") / "frequency_analyzer_matplotlib"))
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    return plt
+
+
+def save_waveform_png_from_samples(
+    samples: list[float],
+    sample_rate: int,
+    title: str,
+    output_path: Path,
+) -> None:
+    plt = pyplot_module()
+    points, duration = waveform_trace(samples, sample_rate)
+    times = [time for time, _ in points]
+    amplitudes = [amplitude for _, amplitude in points]
+    figure, axis = plt.subplots(figsize=(10, 4.2), dpi=140)
+    axis.plot(times, amplitudes, color="#2563eb", linewidth=0.9)
+    axis.axhline(0, color="#64748b", linewidth=0.8)
+    axis.set_title(f"Waveform: {title}")
+    axis.set_xlabel("Time (seconds)")
+    axis.set_ylabel("Amplitude")
+    axis.set_xlim(0, max(duration, 0.001))
+    axis.set_ylim(-1.05, 1.05)
+    axis.grid(True, color="#cbd5e1", linewidth=0.5)
+    figure.tight_layout()
+    figure.savefig(output_path)
+    plt.close(figure)
+
+
+def save_spectrum_png_from_bins(
+    title: str,
+    bins: list[tuple[float, float]],
+    output_path: Path,
+    max_spectrum_hz: float,
+    db_scale: bool = False,
+    subtitle: str = "",
+) -> None:
+    plt = pyplot_module()
+    visible_bins = [(frequency, magnitude) for frequency, magnitude in bins if frequency <= max_spectrum_hz]
+    frequencies = [frequency for frequency, _ in visible_bins]
+    if db_scale:
+        magnitudes = [20 * math.log10(max(magnitude, 1e-12)) for _, magnitude in visible_bins]
+        ylabel = "dB magnitude"
+        color = "#be123c"
+    else:
+        magnitudes = [magnitude for _, magnitude in visible_bins]
+        ylabel = "Mean magnitude"
+        color = "#0f766e"
+    figure, axis = plt.subplots(figsize=(10, 4.2), dpi=140)
+    axis.plot(frequencies, magnitudes, color=color, linewidth=1.1)
+    axis.set_title(f"Average FFT Spectrum: {title}")
+    if subtitle:
+        axis.text(0.5, 1.01, subtitle, transform=axis.transAxes, ha="center", va="bottom", fontsize=8)
+    axis.set_xlabel("Frequency (Hz)")
+    axis.set_ylabel(ylabel)
+    axis.set_xlim(0, max(1.0, max_spectrum_hz))
+    axis.grid(True, color="#cbd5e1", linewidth=0.5)
+    figure.tight_layout()
+    figure.savefig(output_path)
+    plt.close(figure)
+
+
+def save_spectrogram_png_from_samples(
+    samples: list[float],
+    sample_rate: int,
+    title: str,
+    output_path: Path,
+    fft_size: int,
+    max_frequency_hz: float,
+    subtitle: str = "",
+) -> None:
+    plt = pyplot_module()
+    cells, duration, frequency_limit, actual_fft_size = spectrogram_cells_from_samples(
+        samples,
+        sample_rate,
+        fft_size,
+        max_frequency_hz,
+    )
+    data = [
+        [math.log10(1 + value) for value in row]
+        for row in zip(*cells)
+    ] if cells else [[0.0]]
+    figure, axis = plt.subplots(figsize=(10, 5.6), dpi=140)
+    image = axis.imshow(
+        data,
+        origin="lower",
+        aspect="auto",
+        extent=[0, max(duration, 0.001), 0, frequency_limit],
+        cmap="viridis",
+    )
+    colorbar = figure.colorbar(image, ax=axis, pad=0.02)
+    colorbar.set_label("Relative magnitude (log scale)")
+    axis.set_title(f"Frequency vs Time: {title}")
+    if subtitle:
+        axis.text(
+            0.5,
+            1.01,
+            f"Spectrogram FFT size {actual_fft_size}; {subtitle}",
+            transform=axis.transAxes,
+            ha="center",
+            va="bottom",
+            fontsize=8,
+        )
+    axis.set_xlabel("Time (seconds)")
+    axis.set_ylabel("Frequency (Hz)")
+    figure.tight_layout()
+    figure.savefig(output_path)
+    plt.close(figure)
+
+
+def save_dominant_over_time_png(
+    title: str,
+    frames: list[dict[str, float]],
+    output_path: Path,
+    y_max_hz: float,
+    subtitle: str = "",
+) -> None:
+    plt = pyplot_module()
+    times = [frame["time_seconds"] for frame in frames]
+    frequencies = [frame["dominant_frequency_hz"] for frame in frames]
+    figure, axis = plt.subplots(figsize=(10, 4.2), dpi=140)
+    axis.plot(times, frequencies, color="#7c3aed", linewidth=1.1)
+    axis.set_title(f"Dominant Frequency Over Time: {title}")
+    if subtitle:
+        axis.text(0.5, 1.01, subtitle, transform=axis.transAxes, ha="center", va="bottom", fontsize=8)
+    axis.set_xlabel("Time (seconds)")
+    axis.set_ylabel("Hz")
+    axis.set_ylim(0, max(1.0, y_max_hz))
+    axis.grid(True, color="#cbd5e1", linewidth=0.5)
+    figure.tight_layout()
+    figure.savefig(output_path)
+    plt.close(figure)
+
+
+def save_spectrum_variability_png(
+    title: str,
+    frequency_bins: list[float],
+    center_values: list[float],
+    low_values: list[float],
+    high_values: list[float],
+    output_path: Path,
+    max_spectrum_hz: float,
+    subtitle: str = "",
+) -> None:
+    plt = pyplot_module()
+    visible = [
+        (frequency, center, low, high)
+        for frequency, center, low, high in zip(frequency_bins, center_values, low_values, high_values)
+        if frequency <= max_spectrum_hz
+    ]
+    frequencies = [item[0] for item in visible]
+    center = [item[1] for item in visible]
+    low = [item[2] for item in visible]
+    high = [item[3] for item in visible]
+    figure, axis = plt.subplots(figsize=(10, 4.2), dpi=140)
+    axis.fill_between(frequencies, low, high, color="#99f6e4", alpha=0.7)
+    axis.plot(frequencies, center, color="#0f766e", linewidth=1.1)
+    axis.set_title(f"Segment Spectrum Variability: {title}")
+    if subtitle:
+        axis.text(0.5, 1.01, subtitle, transform=axis.transAxes, ha="center", va="bottom", fontsize=8)
+    axis.set_xlabel("Frequency (Hz)")
+    axis.set_ylabel("Mean magnitude")
+    axis.set_xlim(0, max(1.0, max_spectrum_hz))
+    axis.grid(True, color="#cbd5e1", linewidth=0.5)
+    figure.tight_layout()
+    figure.savefig(output_path)
+    plt.close(figure)
+
+
 def heat_color(value: float) -> str:
     """Map a normalized 0..1 value to a dark-blue through yellow heat color."""
     value = max(0.0, min(1.0, value))
@@ -769,6 +1208,29 @@ def write_frequency_time_svg_from_samples(
             elements.append(
                 f'<rect x="{x:.2f}" y="{y:.2f}" width="{cell_width + 0.25:.2f}" height="{cell_height + 0.25:.2f}" fill="{heat_color(normalized)}"/>'
             )
+
+    legend_width = 188
+    legend_height = 58
+    legend_x = width - right - legend_width - 12
+    legend_y = top + 12
+    bar_x = legend_x + 14
+    bar_y = legend_y + 28
+    bar_width = legend_width - 28
+    bar_height = 12
+    elements.append(
+        f'<rect x="{legend_x}" y="{legend_y}" width="{legend_width}" height="{legend_height}" '
+        'fill="#f8fafc" opacity="0.92" stroke="#cbd5e1" rx="4"/>'
+    )
+    elements.append(svg_text(legend_x + legend_width / 2, legend_y + 18, "Color = relative magnitude", 11))
+    for step in range(80):
+        value = step / 79
+        x = bar_x + value * bar_width
+        elements.append(
+            f'<rect x="{x:.2f}" y="{bar_y}" width="{bar_width / 79 + 0.5:.2f}" height="{bar_height}" fill="{heat_color(value)}"/>'
+        )
+    elements.append(svg_text(bar_x, legend_y + 54, "low", 10, "start"))
+    elements.append(svg_text(bar_x + bar_width / 2, legend_y + 54, "log scale", 10))
+    elements.append(svg_text(bar_x + bar_width, legend_y + 54, "high", 10, "end"))
 
     elements.extend(
         [
@@ -1070,7 +1532,7 @@ def write_results_audit_md(rows: list[dict[str, str | float | bool]], output_pat
     ]
     filtered_rows = [
         row for row in rows
-        if "filtered" in str(row["output_type"]) and "dominant-only" in str(row["output_type"])
+        if "filtered" in str(row["output_type"]) and "dominant-sine" in str(row["output_type"])
     ]
 
     lines = [
@@ -1180,36 +1642,625 @@ def make_dirs(*paths: Path) -> None:
         path.mkdir(parents=True, exist_ok=True)
 
 
+def top_frequency_peaks(
+    bins: list[tuple[float, float]],
+    min_frequency_hz: float,
+    max_frequency_hz: float | None,
+    count: int = 5,
+) -> list[dict[str, float]]:
+    candidates = [
+        (frequency, magnitude)
+        for frequency, magnitude in bins
+        if frequency >= min_frequency_hz
+        and (max_frequency_hz is None or frequency <= max_frequency_hz)
+    ]
+    candidates.sort(key=lambda item: item[1], reverse=True)
+    return [
+        {"frequency_hz": frequency, "magnitude": magnitude}
+        for frequency, magnitude in candidates[:count]
+    ]
+
+
+def is_hum_frequency(frequency_hz: float, hum_frequency_hz: float, harmonics: int, tolerance_hz: float = 3.0) -> bool:
+    if hum_frequency_hz <= 0 or harmonics < 1:
+        return False
+    for harmonic in range(1, harmonics + 1):
+        if abs(frequency_hz - hum_frequency_hz * harmonic) <= tolerance_hz:
+            return True
+    return False
+
+
+def dominant_non_hum_frequency(
+    bins: list[tuple[float, float]],
+    min_frequency_hz: float,
+    max_frequency_hz: float | None,
+    hum_frequency_hz: float,
+    harmonics: int,
+) -> tuple[float, float]:
+    candidates = [
+        (frequency, magnitude)
+        for frequency, magnitude in bins
+        if frequency >= min_frequency_hz
+        and (max_frequency_hz is None or frequency <= max_frequency_hz)
+        and not is_hum_frequency(frequency, hum_frequency_hz, harmonics)
+    ]
+    return max(candidates, key=lambda item: item[1], default=(0.0, 0.0))
+
+
+def segment_sample_ranges(
+    sample_count: int,
+    sample_rate: int,
+    duration_seconds: float,
+    overlap_seconds: float,
+) -> list[tuple[int, int, float, float]]:
+    segment_size = max(1, round(duration_seconds * sample_rate))
+    overlap_size = max(0, round(overlap_seconds * sample_rate))
+    hop_size = max(1, segment_size - overlap_size)
+    ranges = []
+    start = 0
+    while start < sample_count:
+        end = min(sample_count, start + segment_size)
+        if end > start:
+            ranges.append((start, end, start / sample_rate, end / sample_rate))
+        if end == sample_count:
+            break
+        start += hop_size
+    return ranges
+
+
+def interpolate_spectrum(
+    spectrum: list[tuple[float, float]],
+    target_frequencies: list[float],
+) -> list[float]:
+    if not spectrum:
+        return [0.0] * len(target_frequencies)
+    source_frequencies = [frequency for frequency, _ in spectrum]
+    source_magnitudes = [magnitude for _, magnitude in spectrum]
+    values = []
+    source_index = 0
+    for target in target_frequencies:
+        while source_index + 1 < len(source_frequencies) and source_frequencies[source_index + 1] < target:
+            source_index += 1
+        if target <= source_frequencies[0]:
+            values.append(source_magnitudes[0])
+        elif target >= source_frequencies[-1]:
+            values.append(source_magnitudes[-1])
+        else:
+            left_frequency = source_frequencies[source_index]
+            right_frequency = source_frequencies[source_index + 1]
+            left_magnitude = source_magnitudes[source_index]
+            right_magnitude = source_magnitudes[source_index + 1]
+            fraction = (target - left_frequency) / (right_frequency - left_frequency)
+            values.append(left_magnitude + (right_magnitude - left_magnitude) * fraction)
+    return values
+
+
+def percentile(sorted_values: list[float], fraction: float) -> float:
+    if not sorted_values:
+        return 0.0
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    position = fraction * (len(sorted_values) - 1)
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return sorted_values[lower]
+    return sorted_values[lower] + (sorted_values[upper] - sorted_values[lower]) * (position - lower)
+
+
+def write_segments_summary_csv(rows: list[dict[str, object]], output_path: Path) -> None:
+    fieldnames = [
+        "segment_index",
+        "start_time_seconds",
+        "end_time_seconds",
+        "raw_dominant_frequency_hz",
+        "dominant_non_hum_frequency_hz",
+        "detected_hum_present",
+        "mean_magnitude",
+        "peak_magnitude",
+    ]
+    with output_path.open("w", newline="") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(
+                {
+                    "segment_index": row["segment_index"],
+                    "start_time_seconds": f"{float(row['start_time_seconds']):.6f}",
+                    "end_time_seconds": f"{float(row['end_time_seconds']):.6f}",
+                    "raw_dominant_frequency_hz": f"{float(row['raw_dominant_frequency_hz']):.6f}",
+                    "dominant_non_hum_frequency_hz": f"{float(row['dominant_non_hum_frequency_hz']):.6f}",
+                    "detected_hum_present": row["detected_hum_present"],
+                    "mean_magnitude": f"{float(row['mean_magnitude']):.12f}",
+                    "peak_magnitude": f"{float(row['peak_magnitude']):.12f}",
+                }
+            )
+
+
+def clean_generated_outputs(path: Path) -> None:
+    """Delete only generated analyzer outputs."""
+    protected_names = {"", ".", "/", "Data", ".git"}
+    if path.name in protected_names:
+        raise ValueError(f"Refusing to clean protected path: {path}")
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def dedupe_existing_results(path: Path, keep_csv: bool = False) -> dict[str, int]:
+    """Remove redundant generated files according to the clean output policy."""
+    removed = {"svg": 0, "csv": 0}
+    if not path.exists():
+        return removed
+    for svg_path in path.rglob("*.svg"):
+        png_peer = svg_path.with_suffix(".png")
+        if png_peer.exists():
+            svg_path.unlink()
+            removed["svg"] += 1
+    if not keep_csv:
+        for csv_path in path.rglob("*.csv"):
+            csv_path.unlink()
+            removed["csv"] += 1
+    return removed
+
+
+def denoising_settings_text(
+    highpass_cutoff_hz: float,
+    notch_frequency_hz: float,
+    notch_harmonics: int,
+) -> str:
+    parts = [f"high-pass {highpass_cutoff_hz:.0f} Hz"]
+    if notch_frequency_hz > 0 and notch_harmonics > 0:
+        parts.append(f"notch {notch_frequency_hz:.0f} Hz x {notch_harmonics} harmonics")
+    else:
+        parts.append("notch off")
+    return ", ".join(parts)
+
+
+def spectrogram_matrix_db(
+    samples: list[float],
+    sample_rate: int,
+    fft_size: int,
+    max_frequency_hz: float,
+    enhanced: bool = False,
+    noise_percentile: float = 20.0,
+) -> tuple[list[list[float]], float, float, int]:
+    cells, duration, frequency_limit, actual_fft_size = spectrogram_cells_from_samples(
+        samples,
+        sample_rate,
+        fft_size,
+        max_frequency_hz,
+    )
+    if not cells:
+        return [[-120.0]], duration, frequency_limit, actual_fft_size
+    band_count = len(cells[0])
+    columns = len(cells)
+    processed = [[cells[column][band] for column in range(columns)] for band in range(band_count)]
+    if enhanced:
+        for band_index, row in enumerate(processed):
+            sorted_row = sorted(row)
+            floor = percentile(sorted_row, max(0.0, min(1.0, noise_percentile / 100)))
+            processed[band_index] = [max(0.0, value - floor) for value in row]
+    return [
+        [20 * math.log10(max(value, 1e-12)) for value in row]
+        for row in processed
+    ], duration, frequency_limit, actual_fft_size
+
+
+def extract_pitch_contour(
+    spectrogram_db: list[list[float]],
+    duration: float,
+    frequency_limit: float,
+    min_pitch_frequency_hz: float,
+    notch_frequency_hz: float,
+    notch_harmonics: int,
+) -> list[dict[str, float]]:
+    if not spectrogram_db or not spectrogram_db[0]:
+        return []
+    band_count = len(spectrogram_db)
+    column_count = len(spectrogram_db[0])
+    contour = []
+    for column_index in range(column_count):
+        best_frequency = 0.0
+        best_db = -1e9
+        for band_index in range(band_count):
+            frequency = (band_index + 0.5) * frequency_limit / band_count
+            if frequency < min_pitch_frequency_hz:
+                continue
+            if is_hum_frequency(frequency, notch_frequency_hz, notch_harmonics):
+                continue
+            value = spectrogram_db[band_index][column_index]
+            if value > best_db:
+                best_db = value
+                best_frequency = frequency
+        contour.append(
+            {
+                "time_seconds": duration * column_index / max(1, column_count - 1),
+                "dominant_frequency_hz": best_frequency,
+                "dominant_magnitude": best_db,
+            }
+        )
+    if len(contour) < 3:
+        return contour
+    smoothed = []
+    for index, point in enumerate(contour):
+        start = max(0, index - 1)
+        end = min(len(contour), index + 2)
+        values = [contour[item]["dominant_frequency_hz"] for item in range(start, end)]
+        smoothed.append({**point, "dominant_frequency_hz": statistics.fmean(values)})
+    return smoothed
+
+
+def save_clean_spectrogram_png(
+    samples: list[float],
+    sample_rate: int,
+    source_name: str,
+    output_path: Path,
+    title: str,
+    fft_size: int,
+    max_frequency_hz: float,
+    dynamic_range_db: float,
+    subtitle: str,
+    enhanced: bool = False,
+    noise_percentile: float = 20.0,
+    pitch_contour: list[dict[str, float]] | None = None,
+) -> tuple[list[list[float]], list[dict[str, float]], float]:
+    plt = pyplot_module()
+    matrix_db, duration, frequency_limit, _actual_fft_size = spectrogram_matrix_db(
+        samples,
+        sample_rate,
+        fft_size,
+        max_frequency_hz,
+        enhanced,
+        noise_percentile,
+    )
+    max_db = max((max(row) for row in matrix_db), default=0.0)
+    min_db = max_db - dynamic_range_db
+    figure, axis = plt.subplots(figsize=(10, 5.6), dpi=140)
+    image = axis.imshow(
+        matrix_db,
+        origin="lower",
+        aspect="auto",
+        extent=[0, max(duration, 0.001), 0, frequency_limit],
+        cmap="viridis",
+        vmin=min_db,
+        vmax=max_db,
+    )
+    colorbar = figure.colorbar(image, ax=axis, pad=0.02)
+    colorbar.set_label("Magnitude (dB)")
+    if pitch_contour:
+        times = [point["time_seconds"] for point in pitch_contour]
+        frequencies = [point["dominant_frequency_hz"] for point in pitch_contour]
+        axis.plot(times, frequencies, color="#ffffff", linewidth=1.4)
+        axis.plot(times, frequencies, color="#ef4444", linewidth=0.7)
+    axis.set_title(f"{title} - {source_name}")
+    axis.text(0.5, 1.01, subtitle, transform=axis.transAxes, ha="center", va="bottom", fontsize=8)
+    axis.set_xlabel("Time (seconds)")
+    axis.set_ylabel("Frequency (Hz)")
+    figure.tight_layout()
+    figure.savefig(output_path)
+    plt.close(figure)
+    return matrix_db, pitch_contour or [], frequency_limit
+
+
+def save_pitch_contour_png(
+    source_name: str,
+    contour: list[dict[str, float]],
+    output_path: Path,
+    max_frequency_hz: float,
+    subtitle: str,
+) -> None:
+    save_dominant_over_time_png(
+        source_name,
+        contour,
+        output_path,
+        max_frequency_hz,
+        subtitle,
+    )
+
+
+def write_clean_summary_md(summary: dict[str, object], output_path: Path) -> None:
+    lines = [
+        f"# Audio Frequency Analysis: {summary['file']}",
+        "",
+        "## Default Outputs",
+        "- `waveform.png`: original waveform.",
+        "- `spectrogram_raw.png`: raw analysis spectrogram.",
+        "- `spectrogram_denoised.png`: high-pass/notch filtered spectrogram.",
+        "- `spectrogram_enhanced_pitch.png`: noise-floor suppressed spectrogram with pitch contour.",
+        "- `average_spectrum_db.png`: denoised average spectrum.",
+        "- `pitch_contour.png`: extracted pitch contour over time.",
+        "- `audio/denoised_filtered.wav`: denoised audio that preserves the recording while reducing noise.",
+        "- `audio/isolated_pitch_band.wav`: isolated audio around the selected non-hum pitch band.",
+        "- `audio/isolated_pitch_contour.wav`: contour-focused isolated audio when pitch contour extraction is enabled.",
+        "",
+        "## Definitions",
+        "- Denoised audio removes noise while preserving as much of the original recording as possible.",
+        "- Isolated audio extracts a target signal and may discard other content.",
+        "",
+        "## Settings",
+        f"- Original sample rate: {summary['original_sample_rate_hz']} Hz",
+        f"- Analysis sample rate: {summary['analysis_sample_rate_hz']} Hz",
+        f"- Frequency range shown: {summary['min_frequency_hz']}-{summary['max_frequency_hz_used']} Hz",
+        f"- Denoising: {summary['denoising']['settings']}",  # type: ignore[index]
+        "",
+        "Debug outputs are intentionally verbose and are generated only when debug flags are used.",
+    ]
+    output_path.write_text("\n".join(lines) + "\n")
+
+
+def run_clean_analysis(args: argparse.Namespace) -> None:
+    if args.clean_outputs:
+        clean_generated_outputs(args.results_dir)
+    else:
+        args.results_dir.mkdir(parents=True, exist_ok=True)
+    if args.dedupe_existing_results:
+        removed = dedupe_existing_results(args.results_dir, args.keep_csv)
+        print(f"Deduped existing outputs: removed {removed['svg']} SVG files and {removed['csv']} CSV files")
+
+    wav_files = sorted(args.data_dir.glob("*.wav"))
+    if not wav_files:
+        raise SystemExit(f"No WAV files found in {args.data_dir}")
+
+    for wav_file in wav_files:
+        original_samples, original_sample_rate, channels = read_mono_wav(wav_file)
+        analysis_samples, sample_rate, resampled_for_analysis = choose_analysis_audio(
+            original_samples,
+            original_sample_rate,
+            args.analysis_sample_rate_hz,
+            args.resample,
+            args.resample_method,
+        )
+        min_frequency_hz, max_frequency_hz, warnings = clamp_frequency_settings(
+            sample_rate,
+            args.min_frequency_hz,
+            args.max_frequency_hz,
+        )
+        max_frequency_used = max_frequency_hz if max_frequency_hz is not None else sample_rate / 2
+        file_dir = args.results_dir / wav_file.stem
+        audio_dir = file_dir / "audio"
+        segment_root = file_dir / "segments"
+        averages_dir = file_dir / "segment_averages"
+        make_dirs(file_dir, audio_dir, segment_root, averages_dir)
+
+        denoised_original = filter_frequency_band(
+            original_samples,
+            original_sample_rate,
+            args.highpass_cutoff_hz,
+            None,
+            args.notch_frequency_hz,
+            args.notch_harmonics,
+        )
+        denoised_analysis, _, _ = choose_analysis_audio(
+            denoised_original,
+            original_sample_rate,
+            sample_rate,
+            args.resample,
+            args.resample_method,
+        )
+        settings = denoising_settings_text(args.highpass_cutoff_hz, args.notch_frequency_hz, args.notch_harmonics)
+        subtitle = (
+            f"{wav_file.name}; analysis sample rate {sample_rate} Hz; "
+            f"{min_frequency_hz:.0f}-{max_frequency_used:.0f} Hz; {settings}"
+        )
+
+        save_waveform_png_from_samples(original_samples, original_sample_rate, "Original waveform", file_dir / "waveform.png")
+        save_clean_spectrogram_png(analysis_samples, sample_rate, wav_file.name, file_dir / "spectrogram_raw.png", "Raw spectrogram", args.spectrogram_fft_size, max_frequency_used, args.spectrogram_dynamic_range_db, subtitle)
+        save_clean_spectrogram_png(denoised_analysis, sample_rate, wav_file.name, file_dir / "spectrogram_denoised.png", "Denoised spectrogram", args.spectrogram_fft_size, max_frequency_used, args.spectrogram_dynamic_range_db, subtitle)
+        enhanced_matrix, _, frequency_limit = save_clean_spectrogram_png(
+            denoised_analysis,
+            sample_rate,
+            wav_file.name,
+            file_dir / "spectrogram_enhanced_pitch.png",
+            "Enhanced pitch contour",
+            args.spectrogram_fft_size,
+            max_frequency_used,
+            args.spectrogram_dynamic_range_db,
+            subtitle,
+            True,
+            args.noise_floor_percentile,
+        )
+        contour = extract_pitch_contour(
+            enhanced_matrix,
+            len(denoised_analysis) / sample_rate if sample_rate else 0.0,
+            frequency_limit,
+            args.min_pitch_frequency_hz,
+            args.notch_frequency_hz,
+            args.notch_harmonics,
+        )
+        save_clean_spectrogram_png(
+            denoised_analysis,
+            sample_rate,
+            wav_file.name,
+            file_dir / "spectrogram_enhanced_pitch.png",
+            "Enhanced pitch contour",
+            args.spectrogram_fft_size,
+            max_frequency_used,
+            args.spectrogram_dynamic_range_db,
+            subtitle,
+            True,
+            args.noise_floor_percentile,
+            contour,
+        )
+        save_pitch_contour_png(wav_file.name, contour, file_dir / "pitch_contour.png", max_frequency_used, subtitle)
+
+        denoised_analysis_result = analyze_samples_over_time(
+            wav_file.name,
+            denoised_analysis,
+            sample_rate,
+            channels,
+            args.fft_size,
+            args.hop_size,
+            min_frequency_hz,
+            max_frequency_used,
+        )
+        denoised_spectrum = denoised_analysis_result["average_spectrum"]  # type: ignore[assignment]
+        save_spectrum_png_from_bins(wav_file.name, denoised_spectrum, file_dir / "average_spectrum_db.png", max_frequency_used, True, subtitle)  # type: ignore[arg-type]
+
+        dominant_non_hum_hz, _dominant_non_hum_mag = dominant_non_hum_frequency(
+            denoised_spectrum,  # type: ignore[arg-type]
+            args.min_pitch_frequency_hz,
+            max_frequency_used,
+            args.notch_frequency_hz,
+            args.notch_harmonics,
+        )
+        if dominant_non_hum_hz <= 0:
+            dominant_non_hum_hz = float(denoised_analysis_result["global_dominant_frequency_hz"])
+        band_half_width = args.isolated_band_width_hz / 2
+        isolated_low = max(args.min_pitch_frequency_hz, dominant_non_hum_hz - band_half_width)
+        isolated_high = min(max_frequency_used, dominant_non_hum_hz + band_half_width)
+        if isolated_high <= isolated_low:
+            isolated_high = min(max_frequency_used, isolated_low + args.isolated_band_width_hz)
+        isolated_band = filter_frequency_band(denoised_original, original_sample_rate, isolated_low, isolated_high, 0, 0)
+        contour_band = filter_frequency_band(
+            denoised_original,
+            original_sample_rate,
+            max(args.min_pitch_frequency_hz, dominant_non_hum_hz - args.isolated_band_width_hz),
+            min(max_frequency_used, dominant_non_hum_hz + args.isolated_band_width_hz),
+            0,
+            0,
+        )
+        if args.export_filtered_audio:
+            write_wav_from_mono(denoised_original, original_sample_rate, channels, audio_dir / "denoised_filtered.wav")
+            write_wav_from_mono(isolated_band, original_sample_rate, channels, audio_dir / "isolated_pitch_band.wav")
+            if args.extract_pitch_profile:
+                write_wav_from_mono(contour_band, original_sample_rate, channels, audio_dir / "isolated_pitch_contour.wav")
+
+        segment_spectra: list[list[tuple[float, float]]] = []
+        segment_summary: list[dict[str, int | float]] = []
+        ranges = segment_sample_ranges(len(denoised_analysis), sample_rate, args.segment_duration_seconds, args.segment_overlap_seconds)
+        for index, (start, end, start_seconds, end_seconds) in enumerate(ranges):
+            segment_dir = segment_root / f"segment_{index:03d}_{start_seconds:.2f}s_{end_seconds:.2f}s"
+            make_dirs(segment_dir)
+            raw_segment = analysis_samples[start:end]
+            denoised_segment = denoised_analysis[start:end]
+            title_suffix = f"{wav_file.name}, {start_seconds:.2f}-{end_seconds:.2f} s"
+            segment_subtitle = f"{title_suffix}; analysis sample rate {sample_rate} Hz; {min_frequency_hz:.0f}-{max_frequency_used:.0f} Hz; {settings}"
+            save_waveform_png_from_samples(raw_segment, sample_rate, "Original waveform", segment_dir / "waveform.png")
+            save_clean_spectrogram_png(raw_segment, sample_rate, title_suffix, segment_dir / "spectrogram_raw.png", "Raw spectrogram", args.spectrogram_fft_size, max_frequency_used, args.spectrogram_dynamic_range_db, segment_subtitle)
+            save_clean_spectrogram_png(denoised_segment, sample_rate, title_suffix, segment_dir / "spectrogram_denoised.png", "Denoised spectrogram", args.spectrogram_fft_size, max_frequency_used, args.spectrogram_dynamic_range_db, segment_subtitle)
+            segment_matrix, _, segment_frequency_limit = save_clean_spectrogram_png(denoised_segment, sample_rate, title_suffix, segment_dir / "spectrogram_enhanced_pitch.png", "Enhanced pitch contour", args.spectrogram_fft_size, max_frequency_used, args.spectrogram_dynamic_range_db, segment_subtitle, True, args.noise_floor_percentile)
+            segment_contour = extract_pitch_contour(segment_matrix, len(denoised_segment) / sample_rate if sample_rate else 0.0, segment_frequency_limit, args.min_pitch_frequency_hz, args.notch_frequency_hz, args.notch_harmonics)
+            save_clean_spectrogram_png(denoised_segment, sample_rate, title_suffix, segment_dir / "spectrogram_enhanced_pitch.png", "Enhanced pitch contour", args.spectrogram_fft_size, max_frequency_used, args.spectrogram_dynamic_range_db, segment_subtitle, True, args.noise_floor_percentile, segment_contour)
+            save_pitch_contour_png(title_suffix, segment_contour, segment_dir / "pitch_contour.png", max_frequency_used, segment_subtitle)
+            segment_analysis = analyze_samples_over_time(title_suffix, denoised_segment, sample_rate, channels, args.fft_size, args.hop_size, min_frequency_hz, max_frequency_used)
+            segment_spectrum = segment_analysis["average_spectrum"]  # type: ignore[assignment]
+            segment_spectra.append(segment_spectrum)  # type: ignore[arg-type]
+            save_spectrum_png_from_bins(title_suffix, segment_spectrum, segment_dir / "average_spectrum_db.png", max_frequency_used, True, segment_subtitle)  # type: ignore[arg-type]
+            segment_row = {
+                "segment_index": index,
+                "start_time_seconds": start_seconds,
+                "end_time_seconds": end_seconds,
+                "dominant_non_hum_frequency_hz": dominant_non_hum_frequency(segment_spectrum, args.min_pitch_frequency_hz, max_frequency_used, args.notch_frequency_hz, args.notch_harmonics)[0],  # type: ignore[arg-type]
+                "pitch_contour_points": len(segment_contour),
+            }
+            segment_summary.append(segment_row)
+            (segment_dir / "summary.json").write_text(json.dumps(segment_row, indent=2) + "\n")
+
+        if segment_spectra:
+            target_frequencies = [frequency for frequency, _ in segment_spectra[0]]
+            stacked = [interpolate_spectrum(spectrum, target_frequencies) for spectrum in segment_spectra]
+            mean_values = [statistics.fmean(values) for values in zip(*stacked)]
+            median_values = [statistics.median(values) for values in zip(*stacked)]
+            std_values = [statistics.pstdev(values) if len(values) > 1 else 0.0 for values in zip(*stacked)]
+            q25_values = [percentile(sorted(values), 0.25) for values in zip(*stacked)]
+            q75_values = [percentile(sorted(values), 0.75) for values in zip(*stacked)]
+            save_spectrum_png_from_bins(wav_file.name, list(zip(target_frequencies, mean_values)), averages_dir / "mean_segment_spectrum_db.png", max_frequency_used, True, "mean segment spectrum")
+            save_spectrum_png_from_bins(wav_file.name, list(zip(target_frequencies, median_values)), averages_dir / "median_segment_spectrum_db.png", max_frequency_used, True, "median segment spectrum")
+            save_spectrum_variability_png(wav_file.name, target_frequencies, mean_values, [max(0.0, mean - std) for mean, std in zip(mean_values, std_values)], [mean + std for mean, std in zip(mean_values, std_values)], averages_dir / "segment_spectrum_variability.png", max_frequency_used, "mean +/- 1 std")
+            save_spectrum_variability_png(wav_file.name, target_frequencies, median_values, q25_values, q75_values, averages_dir / "pitch_contours_over_segments.png", max_frequency_used, "25th-75th percentile band")
+            (averages_dir / "summary.json").write_text(json.dumps({"segment_count": len(segment_spectra)}, indent=2) + "\n")
+
+        if args.export_csv:
+            csv_dir = file_dir / "csv"
+            make_dirs(csv_dir)
+            write_average_fft_csv(wav_file, csv_dir, denoised_analysis_result)
+            with (csv_dir / "segment_summary.csv").open("w", newline="") as csv_file:
+                fieldnames = ["segment_index", "start_time_seconds", "end_time_seconds", "dominant_non_hum_frequency_hz", "pitch_contour_points"]
+                writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+                writer.writeheader()
+                for row in segment_summary:
+                    writer.writerow(row)
+            write_dominant_over_time_csv(wav_file, csv_dir, contour)
+
+        if args.export_debug_plots:
+            debug_dir = file_dir / "debug" / "plots"
+            make_dirs(debug_dir)
+            save_spectrum_png_from_bins(wav_file.name, fft_bins_from_samples(analysis_samples, sample_rate, args.fft_size), debug_dir / "pre_filter_spectrum.png", max_frequency_used, True, "pre-filter spectrum")
+            save_spectrum_png_from_bins(wav_file.name, denoised_spectrum, debug_dir / "post_highpass_notch_spectrum.png", max_frequency_used, True, "post high-pass/notch spectrum")  # type: ignore[arg-type]
+            save_clean_spectrogram_png(analysis_samples, sample_rate, wav_file.name, debug_dir / "raw_full_range_spectrogram.png", "Raw full-range spectrogram", args.spectrogram_fft_size, min(sample_rate / 2, max_frequency_used), args.spectrogram_dynamic_range_db, subtitle)
+
+        if args.export_debug_audio:
+            debug_audio = audio_dir / "debug"
+            make_dirs(debug_audio)
+            highpass_only = filter_frequency_band(original_samples, original_sample_rate, args.highpass_cutoff_hz, None, 0, 0)
+            notch_only = filter_frequency_band(original_samples, original_sample_rate, None, None, args.notch_frequency_hz, args.notch_harmonics)
+            dominant_only = filter_to_single_frequency(original_samples, original_sample_rate, dominant_non_hum_hz)
+            write_wav_from_mono(highpass_only, original_sample_rate, channels, debug_audio / "highpass_only.wav")
+            write_wav_from_mono(notch_only, original_sample_rate, channels, debug_audio / "notch_only.wav")
+            write_wav_from_mono(denoised_original, original_sample_rate, channels, debug_audio / "highpass_notch.wav")
+            write_wav_from_mono(dominant_only, original_sample_rate, channels, debug_audio / "dominant_sine_only.wav")
+
+        summary = {
+            "file": wav_file.name,
+            "original_sample_rate_hz": original_sample_rate,
+            "analysis_sample_rate_hz": sample_rate,
+            "resampled_for_analysis": resampled_for_analysis,
+            "nyquist_frequency_hz": sample_rate / 2,
+            "min_frequency_hz": min_frequency_hz,
+            "max_frequency_hz_used": max_frequency_used,
+            "denoising": {
+                "highpass_cutoff_hz": args.highpass_cutoff_hz,
+                "notch_frequency_hz": args.notch_frequency_hz,
+                "notch_harmonics": args.notch_harmonics,
+                "settings": settings,
+            },
+            "isolated_audio": {
+                "dominant_non_hum_frequency_hz": dominant_non_hum_hz,
+                "band_low_hz": isolated_low,
+                "band_high_hz": isolated_high,
+            },
+            "segments": segment_summary,
+            "warnings": warnings,
+        }
+        (file_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+        write_clean_summary_md(summary, file_dir / "summary.md")
+
+    print(f"Analyzed {len(wav_files)} WAV files")
+    print(f"Wrote clean outputs to: {args.results_dir}")
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Analyze WAV files with full-file FFT windows.")
+    parser = argparse.ArgumentParser(description="Analyze WAV files and export clean denoised/isolated outputs.")
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     parser.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS_DIR)
     parser.add_argument("--fft-size", type=int, default=FFT_SIZE)
-    parser.add_argument(
-        "--hop-size",
-        type=int,
-        default=None,
-        help="Sliding-window hop size in samples. Defaults to fft-size // 2.",
-    )
-    parser.add_argument("--min-frequency-hz", type=float, default=20.0)
-    parser.add_argument("--recommended-min-frequency-hz", type=float, default=RECOMMENDED_MIN_FREQUENCY_HZ)
-    parser.add_argument(
-        "--max-frequency-hz",
-        type=float,
-        default=None,
-        help="Maximum frequency considered for dominant-frequency analysis. Default: no upper limit.",
-    )
-    parser.add_argument(
-        "--plot-max-frequency-hz",
-        "--max-spectrum-hz",
-        dest="plot_max_frequency_hz",
-        type=float,
-        default=MAX_SPECTRUM_HZ,
-        help="Full-range y-axis maximum for spectrum and spectrogram plots.",
-    )
+    parser.add_argument("--hop-size", type=int, default=None)
+    parser.add_argument("--min-frequency-hz", type=float, default=RECOMMENDED_MIN_FREQUENCY_HZ)
+    parser.add_argument("--max-frequency-hz", type=float, default=MAX_SPECTRUM_HZ)
+    parser.add_argument("--plot-max-frequency-hz", "--max-spectrum-hz", dest="plot_max_frequency_hz", type=float, default=MAX_SPECTRUM_HZ)
     parser.add_argument("--spectrogram-fft-size", type=int, default=SPECTROGRAM_FFT_SIZE)
-    parser.add_argument("--auto-zoom", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--audit-results", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--analysis-sample-rate-hz", type=int, default=DEFAULT_ANALYSIS_SAMPLE_RATE_HZ)
+    parser.add_argument("--resample", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--resample-method", choices=["polyphase"], default="polyphase")
+    parser.add_argument("--segment-duration-seconds", type=float, default=2.5)
+    parser.add_argument("--segment-overlap-seconds", type=float, default=0.0)
+    parser.add_argument("--export-csv", action="store_true")
+    parser.add_argument("--extract-pitch-profile", action="store_true", default=True)
+    parser.add_argument("--highpass-cutoff-hz", type=float, default=80.0)
+    parser.add_argument("--notch-frequency-hz", type=float, default=50.0)
+    parser.add_argument("--notch-harmonics", type=int, default=8)
+    parser.add_argument("--notch-width-hz", type=float, default=3.0)
+    parser.add_argument("--spectrogram-dynamic-range-db", type=float, default=80.0)
+    parser.add_argument("--noise-floor-percentile", type=float, default=20.0)
+    parser.add_argument("--min-pitch-frequency-hz", type=float, default=80.0)
+    parser.add_argument("--isolated-band-width-hz", type=float, default=80.0)
+    parser.add_argument("--export-debug-plots", action="store_true")
+    parser.add_argument("--export-debug-audio", action="store_true")
+    parser.add_argument("--export-filtered-audio", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--clean-outputs", action="store_true")
+    parser.add_argument("--dedupe-existing-results", action="store_true")
+    parser.add_argument("--keep-csv", action="store_true")
     args = parser.parse_args()
 
     if args.fft_size & (args.fft_size - 1):
@@ -1218,587 +2269,22 @@ def main() -> None:
         raise SystemExit("--hop-size must be at least 1")
     if args.spectrogram_fft_size & (args.spectrogram_fft_size - 1):
         raise SystemExit("--spectrogram-fft-size must be a power of two")
+    if args.analysis_sample_rate_hz < 2:
+        raise SystemExit("--analysis-sample-rate-hz must be at least 2")
+    if args.segment_duration_seconds <= 0:
+        raise SystemExit("--segment-duration-seconds must be greater than 0")
+    if args.segment_overlap_seconds < 0 or args.segment_overlap_seconds >= args.segment_duration_seconds:
+        raise SystemExit("--segment-overlap-seconds must be at least 0 and shorter than segment duration")
+    if args.spectrogram_dynamic_range_db <= 0:
+        raise SystemExit("--spectrogram-dynamic-range-db must be greater than 0")
+    if not 0 <= args.noise_floor_percentile <= 100:
+        raise SystemExit("--noise-floor-percentile must be between 0 and 100")
+    if args.min_pitch_frequency_hz < 0:
+        raise SystemExit("--min-pitch-frequency-hz must be at least 0")
+    if args.isolated_band_width_hz <= 0:
+        raise SystemExit("--isolated-band-width-hz must be greater than 0")
 
-    wav_files = sorted(args.data_dir.glob("*.wav"))
-    if not wav_files:
-        raise SystemExit(f"No WAV files found in {args.data_dir}")
-
-    fft_dir = args.results_dir / "fft"
-    fft_average_dir = args.results_dir / "fft_average"
-    fft_relevant_dir = args.results_dir / "fft_relevant"
-    waveform_dir = args.results_dir / "waveforms"
-    spectrum_dir = args.results_dir / "spectra"
-    spectrum_zoomed_dir = args.results_dir / "spectra_zoomed"
-    spectrum_relevant_dir = args.results_dir / "spectra_relevant"
-    spectrum_relevant_zoomed_dir = args.results_dir / "spectra_relevant_zoomed"
-    frequency_time_dir = args.results_dir / "frequency_time"
-    frequency_time_zoomed_dir = args.results_dir / "frequency_time_zoomed"
-    frequency_time_relevant_dir = args.results_dir / "frequency_time_relevant"
-    frequency_time_relevant_zoomed_dir = args.results_dir / "frequency_time_relevant_zoomed"
-    dominant_over_time_dir = args.results_dir / "dominant_over_time"
-    dominant_over_time_svg_dir = args.results_dir / "dominant_over_time_svg"
-    dominant_over_time_zoomed_svg_dir = args.results_dir / "dominant_over_time_zoomed_svg"
-    filtered_full_dir = args.results_dir / "filtered_full"
-    filtered_full_wav_dir = filtered_full_dir / "wav"
-    filtered_full_waveform_dir = filtered_full_dir / "waveforms"
-    filtered_full_spectrum_dir = filtered_full_dir / "spectra"
-    filtered_full_frequency_time_dir = filtered_full_dir / "frequency_time"
-    filtered_relevant_dir = args.results_dir / "filtered_relevant"
-    filtered_relevant_wav_dir = filtered_relevant_dir / "wav"
-    filtered_relevant_waveform_dir = filtered_relevant_dir / "waveforms"
-    filtered_relevant_spectrum_dir = filtered_relevant_dir / "spectra"
-    filtered_relevant_frequency_time_dir = filtered_relevant_dir / "frequency_time"
-    make_dirs(
-        args.results_dir,
-        fft_dir,
-        fft_average_dir,
-        fft_relevant_dir,
-        waveform_dir,
-        spectrum_dir,
-        spectrum_zoomed_dir,
-        spectrum_relevant_dir,
-        spectrum_relevant_zoomed_dir,
-        frequency_time_dir,
-        frequency_time_zoomed_dir,
-        frequency_time_relevant_dir,
-        frequency_time_relevant_zoomed_dir,
-        dominant_over_time_dir,
-        dominant_over_time_svg_dir,
-        dominant_over_time_zoomed_svg_dir,
-        filtered_full_dir,
-        filtered_full_wav_dir,
-        filtered_full_waveform_dir,
-        filtered_full_spectrum_dir,
-        filtered_full_frequency_time_dir,
-        filtered_relevant_dir,
-        filtered_relevant_wav_dir,
-        filtered_relevant_waveform_dir,
-        filtered_relevant_spectrum_dir,
-        filtered_relevant_frequency_time_dir,
-    )
-
-    dominant_rows: list[dict[str, int | float | str]] = []
-    cutoff_rows: list[dict[str, int | float | str]] = []
-    filtered_audio_rows: list[dict[str, int | float | str]] = []
-    audit_rows: list[dict[str, str | float | bool]] = []
-
-    for wav_file in wav_files:
-        analysis = analyze_dominant_frequency_over_time(
-            wav_file,
-            args.fft_size,
-            args.hop_size,
-            args.min_frequency_hz,
-            args.max_frequency_hz,
-        )
-        samples = analysis["samples"]  # type: ignore[assignment]
-        sample_rate = int(analysis["sample_rate_hz"])
-        channels = int(analysis["channels"])
-        average_spectrum = analysis["average_spectrum"]  # type: ignore[assignment]
-        frames = analysis["frames"]  # type: ignore[assignment]
-        actual_fft_size = int(analysis["fft_size"])
-
-        first_window_bins = fft_bins_from_samples(samples, sample_rate, args.fft_size)  # type: ignore[arg-type]
-        write_first_window_fft_csv(
-            wav_file,
-            fft_dir,
-            first_window_bins,
-            sample_rate,
-            actual_fft_size,
-        )
-        write_average_fft_csv(wav_file, fft_average_dir, analysis)
-        write_dominant_over_time_csv(wav_file, dominant_over_time_dir, frames)  # type: ignore[arg-type]
-
-        global_frequency = float(analysis["global_dominant_frequency_hz"])
-        global_magnitude = float(analysis["global_dominant_magnitude"])
-        relevant_max_frequency_hz = relevant_frequency_cutoff(
-            average_spectrum,  # type: ignore[arg-type]
-            args.plot_max_frequency_hz,
-            RELEVANT_MIN_HZ,
-            RELEVANT_THRESHOLD_FRACTION,
-        )
-        useful_range = detect_useful_frequency_range(
-            average_spectrum,  # type: ignore[arg-type]
-            args.min_frequency_hz,
-            args.max_frequency_hz,
-            hard_plot_ceiling_hz=args.plot_max_frequency_hz,
-        )
-        relevant_bins = [
-            item for item in average_spectrum  # type: ignore[union-attr]
-            if item[0] <= relevant_max_frequency_hz
-        ]
-        relevant_peak_frequency_hz, _ = dominant_frequency(relevant_bins)
-        relevant_useful_range = detect_useful_frequency_range(
-            relevant_bins,
-            args.min_frequency_hz,
-            relevant_max_frequency_hz,
-            hard_plot_ceiling_hz=relevant_max_frequency_hz,
-        )
-        dominant_time_svg = dominant_over_time_svg_dir / f"{wav_file.stem}_dominant_over_time.svg"
-        write_dominant_over_time_svg(
-            wav_file.name,
-            frames,  # type: ignore[arg-type]
-            dominant_time_svg,
-            y_max_hz=args.plot_max_frequency_hz,
-            subtitle="original full range",
-        )
-        dominant_time_zoom_created = False
-        if args.auto_zoom and zoom_needed(float(useful_range["useful_max_frequency_hz"]), args.plot_max_frequency_hz):
-            dominant_time_zoom_created = True
-            low = float(useful_range["useful_min_frequency_hz"])
-            high = float(useful_range["useful_max_frequency_hz"])
-            write_dominant_over_time_svg(
-                wav_file.name,
-                frames,  # type: ignore[arg-type]
-                dominant_over_time_zoomed_svg_dir / f"{wav_file.stem}_dominant_over_time_zoomed_{hz_for_filename(low)}_{hz_for_filename(high)}Hz.svg",
-                y_max_hz=high,
-                subtitle="original",
-                zoomed=True,
-            )
-        audit_rows.append(
-            audit_row(
-                wav_file.name,
-                "dominant frequency over time",
-                dominant_time_svg,
-                0.0,
-                args.plot_max_frequency_hz,
-                useful_range,
-                global_frequency,
-                args.recommended_min_frequency_hz,
-                dominant_time_zoom_created,
-            )
-        )
-        write_fft_bins_csv(
-            wav_file,
-            fft_relevant_dir,
-            average_spectrum,  # type: ignore[arg-type]
-            sample_rate,
-            actual_fft_size,
-            relevant_max_frequency_hz,
-        )
-
-        dominant_rows.append(
-            {
-                "file": wav_file.name,
-                "dominant_frequency_hz": global_frequency,
-                "dominant_magnitude": global_magnitude,
-                "dominant_method": "mean spectrum across full file",
-                "median_frame_dominant_frequency_hz": analysis["median_frame_dominant_frequency_hz"],
-                "mean_frame_dominant_frequency_hz": analysis["mean_frame_dominant_frequency_hz"],
-                "std_frame_dominant_frequency_hz": analysis["std_frame_dominant_frequency_hz"],
-                "strongest_frame_dominant_frequency_hz": analysis["strongest_frame_dominant_frequency_hz"],
-                "strongest_frame_time_seconds": analysis["strongest_frame_time_seconds"],
-                "duration_seconds": analysis["duration_seconds"],
-                "sample_rate_hz": sample_rate,
-                "channels": channels,
-                "fft_size": actual_fft_size,
-                "hop_size": analysis["hop_size"],
-                "frames_analyzed": analysis["number_of_frames_analyzed"],
-            }
-        )
-        cutoff_rows.append(
-            {
-                "file": wav_file.name,
-                "relevant_max_frequency_hz": relevant_max_frequency_hz,
-            }
-        )
-
-        write_waveform_svg_from_samples(
-            samples,  # type: ignore[arg-type]
-            sample_rate,
-            wav_file.name,
-            waveform_dir / f"{wav_file.stem}_waveform.svg",
-        )
-        write_spectrum_svg_from_bins(
-            wav_file.name,
-            average_spectrum,  # type: ignore[arg-type]
-            actual_fft_size,
-            spectrum_dir / f"{wav_file.stem}_fft_spectrum.svg",
-            args.plot_max_frequency_hz,
-            "original full range",
-        )
-        spectrum_zoom_created = False
-        if args.auto_zoom and zoom_needed(float(useful_range["useful_max_frequency_hz"]), args.plot_max_frequency_hz):
-            spectrum_zoom_created = True
-            low = float(useful_range["useful_min_frequency_hz"])
-            high = float(useful_range["useful_max_frequency_hz"])
-            write_spectrum_svg_from_bins(
-                wav_file.name,
-                average_spectrum,  # type: ignore[arg-type]
-                actual_fft_size,
-                spectrum_zoomed_dir / f"{wav_file.stem}_fft_spectrum_zoomed_{hz_for_filename(low)}_{hz_for_filename(high)}Hz.svg",
-                high,
-                "original",
-                True,
-            )
-        audit_rows.append(
-            audit_row(
-                wav_file.name,
-                "average spectrum",
-                spectrum_dir / f"{wav_file.stem}_fft_spectrum.svg",
-                0.0,
-                args.plot_max_frequency_hz,
-                useful_range,
-                global_frequency,
-                args.recommended_min_frequency_hz,
-                spectrum_zoom_created,
-            )
-        )
-        write_spectrum_svg_from_bins(
-            wav_file.name,
-            average_spectrum,  # type: ignore[arg-type]
-            actual_fft_size,
-            spectrum_relevant_dir / f"{wav_file.stem}_fft_spectrum_relevant.svg",
-            relevant_max_frequency_hz,
-            "original relevant range",
-        )
-        relevant_spectrum_zoom_created = False
-        if args.auto_zoom and zoom_needed(float(relevant_useful_range["useful_max_frequency_hz"]), relevant_max_frequency_hz):
-            relevant_spectrum_zoom_created = True
-            low = float(relevant_useful_range["useful_min_frequency_hz"])
-            high = float(relevant_useful_range["useful_max_frequency_hz"])
-            write_spectrum_svg_from_bins(
-                wav_file.name,
-                relevant_bins,
-                actual_fft_size,
-                spectrum_relevant_zoomed_dir / f"{wav_file.stem}_fft_spectrum_relevant_zoomed_{hz_for_filename(low)}_{hz_for_filename(high)}Hz.svg",
-                high,
-                "original relevant",
-                True,
-            )
-        audit_rows.append(
-            audit_row(
-                wav_file.name,
-                "relevant average spectrum",
-                spectrum_relevant_dir / f"{wav_file.stem}_fft_spectrum_relevant.svg",
-                0.0,
-                relevant_max_frequency_hz,
-                relevant_useful_range,
-                relevant_peak_frequency_hz,
-                args.recommended_min_frequency_hz,
-                relevant_spectrum_zoom_created,
-            )
-        )
-        write_frequency_time_svg_from_samples(
-            samples,  # type: ignore[arg-type]
-            sample_rate,
-            wav_file.name,
-            frequency_time_dir / f"{wav_file.stem}_frequency_time.svg",
-            args.spectrogram_fft_size,
-            args.plot_max_frequency_hz,
-            "original full range",
-        )
-        frequency_time_zoom_created = False
-        if args.auto_zoom and zoom_needed(float(useful_range["useful_max_frequency_hz"]), args.plot_max_frequency_hz):
-            frequency_time_zoom_created = True
-            low = float(useful_range["useful_min_frequency_hz"])
-            high = float(useful_range["useful_max_frequency_hz"])
-            write_frequency_time_svg_from_samples(
-                samples,  # type: ignore[arg-type]
-                sample_rate,
-                wav_file.name,
-                frequency_time_zoomed_dir / f"{wav_file.stem}_frequency_time_zoomed_{hz_for_filename(low)}_{hz_for_filename(high)}Hz.svg",
-                args.spectrogram_fft_size,
-                high,
-                "original",
-                True,
-            )
-        audit_rows.append(
-            audit_row(
-                wav_file.name,
-                "frequency time spectrogram",
-                frequency_time_dir / f"{wav_file.stem}_frequency_time.svg",
-                0.0,
-                args.plot_max_frequency_hz,
-                useful_range,
-                global_frequency,
-                args.recommended_min_frequency_hz,
-                frequency_time_zoom_created,
-            )
-        )
-        write_frequency_time_svg_from_samples(
-            samples,  # type: ignore[arg-type]
-            sample_rate,
-            wav_file.name,
-            frequency_time_relevant_dir / f"{wav_file.stem}_frequency_time_relevant.svg",
-            args.spectrogram_fft_size,
-            relevant_max_frequency_hz,
-            "original relevant range",
-        )
-        relevant_frequency_time_zoom_created = False
-        if args.auto_zoom and zoom_needed(float(relevant_useful_range["useful_max_frequency_hz"]), relevant_max_frequency_hz):
-            relevant_frequency_time_zoom_created = True
-            low = float(relevant_useful_range["useful_min_frequency_hz"])
-            high = float(relevant_useful_range["useful_max_frequency_hz"])
-            write_frequency_time_svg_from_samples(
-                samples,  # type: ignore[arg-type]
-                sample_rate,
-                wav_file.name,
-                frequency_time_relevant_zoomed_dir / f"{wav_file.stem}_frequency_time_relevant_zoomed_{hz_for_filename(low)}_{hz_for_filename(high)}Hz.svg",
-                args.spectrogram_fft_size,
-                high,
-                "original relevant",
-                True,
-            )
-        audit_rows.append(
-            audit_row(
-                wav_file.name,
-                "relevant frequency time spectrogram",
-                frequency_time_relevant_dir / f"{wav_file.stem}_frequency_time_relevant.svg",
-                0.0,
-                relevant_max_frequency_hz,
-                relevant_useful_range,
-                relevant_peak_frequency_hz,
-                args.recommended_min_frequency_hz,
-                relevant_frequency_time_zoom_created,
-            )
-        )
-
-        filtered_full_samples = filter_to_single_frequency(
-            samples,  # type: ignore[arg-type]
-            sample_rate,
-            global_frequency,
-        )
-        filtered_relevant_samples = filter_to_single_frequency(
-            samples,  # type: ignore[arg-type]
-            sample_rate,
-            relevant_peak_frequency_hz,
-        )
-        filtered_full_wav = filtered_full_wav_dir / f"{wav_file.stem}_full_dominant_only.wav"
-        filtered_relevant_wav = filtered_relevant_wav_dir / f"{wav_file.stem}_relevant_dominant_only.wav"
-        write_wav_from_mono(filtered_full_samples, sample_rate, channels, filtered_full_wav)
-        write_wav_from_mono(filtered_relevant_samples, sample_rate, channels, filtered_relevant_wav)
-        filtered_audio_rows.extend(
-            [
-                {
-                    "source_file": wav_file.name,
-                    "mode": "full",
-                    "kept_frequency_hz": global_frequency,
-                    "relevant_max_frequency_hz": "",
-                    "output_wav": str(filtered_full_wav),
-                },
-                {
-                    "source_file": wav_file.name,
-                    "mode": "relevant",
-                    "kept_frequency_hz": relevant_peak_frequency_hz,
-                    "relevant_max_frequency_hz": relevant_max_frequency_hz,
-                    "output_wav": str(filtered_relevant_wav),
-                },
-            ]
-        )
-
-        filtered_full_analysis = analyze_dominant_frequency_over_time(
-            filtered_full_wav,
-            args.fft_size,
-            args.hop_size,
-            args.min_frequency_hz,
-            args.max_frequency_hz,
-        )
-        filtered_relevant_analysis = analyze_dominant_frequency_over_time(
-            filtered_relevant_wav,
-            args.fft_size,
-            args.hop_size,
-            args.min_frequency_hz,
-            args.max_frequency_hz,
-        )
-        filtered_full_useful_range = detect_useful_frequency_range(
-            filtered_full_analysis["average_spectrum"],  # type: ignore[arg-type]
-            args.min_frequency_hz,
-            args.max_frequency_hz,
-            hard_plot_ceiling_hz=args.plot_max_frequency_hz,
-        )
-        filtered_relevant_useful_range = detect_useful_frequency_range(
-            filtered_relevant_analysis["average_spectrum"],  # type: ignore[arg-type]
-            args.min_frequency_hz,
-            relevant_max_frequency_hz,
-            hard_plot_ceiling_hz=relevant_max_frequency_hz,
-        )
-        write_waveform_svg_from_samples(
-            filtered_full_samples,
-            sample_rate,
-            filtered_full_wav.name,
-            filtered_full_waveform_dir / f"{wav_file.stem}_full_dominant_only_waveform.svg",
-        )
-        write_spectrum_svg_from_bins(
-            filtered_full_wav.name,
-            filtered_full_analysis["average_spectrum"],  # type: ignore[arg-type]
-            int(filtered_full_analysis["fft_size"]),
-            filtered_full_spectrum_dir / f"{wav_file.stem}_full_dominant_only_spectrum.svg",
-            args.plot_max_frequency_hz,
-            "full dominant-only",
-        )
-        filtered_full_spectrum_zoom_created = False
-        if args.auto_zoom and zoom_needed(float(filtered_full_useful_range["useful_max_frequency_hz"]), args.plot_max_frequency_hz):
-            filtered_full_spectrum_zoom_created = True
-            low = float(filtered_full_useful_range["useful_min_frequency_hz"])
-            high = float(filtered_full_useful_range["useful_max_frequency_hz"])
-            write_spectrum_svg_from_bins(
-                filtered_full_wav.name,
-                filtered_full_analysis["average_spectrum"],  # type: ignore[arg-type]
-                int(filtered_full_analysis["fft_size"]),
-                filtered_full_spectrum_dir / f"{wav_file.stem}_full_dominant_only_spectrum_zoomed_{hz_for_filename(low)}_{hz_for_filename(high)}Hz.svg",
-                high,
-                "full dominant-only",
-                True,
-            )
-        audit_rows.append(
-            audit_row(
-                wav_file.name,
-                "filtered full dominant-only spectrum",
-                filtered_full_spectrum_dir / f"{wav_file.stem}_full_dominant_only_spectrum.svg",
-                0.0,
-                args.plot_max_frequency_hz,
-                filtered_full_useful_range,
-                float(filtered_full_analysis["global_dominant_frequency_hz"]),
-                args.recommended_min_frequency_hz,
-                filtered_full_spectrum_zoom_created,
-                True,
-            )
-        )
-        write_frequency_time_svg_from_samples(
-            filtered_full_samples,
-            sample_rate,
-            filtered_full_wav.name,
-            filtered_full_frequency_time_dir / f"{wav_file.stem}_full_dominant_only_frequency_time.svg",
-            args.spectrogram_fft_size,
-            args.plot_max_frequency_hz,
-            "full dominant-only",
-        )
-        filtered_full_frequency_time_zoom_created = False
-        if args.auto_zoom and zoom_needed(float(filtered_full_useful_range["useful_max_frequency_hz"]), args.plot_max_frequency_hz):
-            filtered_full_frequency_time_zoom_created = True
-            low = float(filtered_full_useful_range["useful_min_frequency_hz"])
-            high = float(filtered_full_useful_range["useful_max_frequency_hz"])
-            write_frequency_time_svg_from_samples(
-                filtered_full_samples,
-                sample_rate,
-                filtered_full_wav.name,
-                filtered_full_frequency_time_dir / f"{wav_file.stem}_full_dominant_only_frequency_time_zoomed_{hz_for_filename(low)}_{hz_for_filename(high)}Hz.svg",
-                args.spectrogram_fft_size,
-                high,
-                "full dominant-only",
-                True,
-            )
-        audit_rows.append(
-            audit_row(
-                wav_file.name,
-                "filtered full dominant-only frequency time spectrogram",
-                filtered_full_frequency_time_dir / f"{wav_file.stem}_full_dominant_only_frequency_time.svg",
-                0.0,
-                args.plot_max_frequency_hz,
-                filtered_full_useful_range,
-                float(filtered_full_analysis["global_dominant_frequency_hz"]),
-                args.recommended_min_frequency_hz,
-                filtered_full_frequency_time_zoom_created,
-                True,
-            )
-        )
-        write_waveform_svg_from_samples(
-            filtered_relevant_samples,
-            sample_rate,
-            filtered_relevant_wav.name,
-            filtered_relevant_waveform_dir / f"{wav_file.stem}_relevant_dominant_only_waveform.svg",
-        )
-        write_spectrum_svg_from_bins(
-            filtered_relevant_wav.name,
-            filtered_relevant_analysis["average_spectrum"],  # type: ignore[arg-type]
-            int(filtered_relevant_analysis["fft_size"]),
-            filtered_relevant_spectrum_dir / f"{wav_file.stem}_relevant_dominant_only_spectrum.svg",
-            relevant_max_frequency_hz,
-            "relevant dominant-only",
-        )
-        filtered_relevant_spectrum_zoom_created = False
-        if args.auto_zoom and zoom_needed(float(filtered_relevant_useful_range["useful_max_frequency_hz"]), relevant_max_frequency_hz):
-            filtered_relevant_spectrum_zoom_created = True
-            low = float(filtered_relevant_useful_range["useful_min_frequency_hz"])
-            high = float(filtered_relevant_useful_range["useful_max_frequency_hz"])
-            write_spectrum_svg_from_bins(
-                filtered_relevant_wav.name,
-                filtered_relevant_analysis["average_spectrum"],  # type: ignore[arg-type]
-                int(filtered_relevant_analysis["fft_size"]),
-                filtered_relevant_spectrum_dir / f"{wav_file.stem}_relevant_dominant_only_spectrum_zoomed_{hz_for_filename(low)}_{hz_for_filename(high)}Hz.svg",
-                high,
-                "relevant dominant-only",
-                True,
-            )
-        audit_rows.append(
-            audit_row(
-                wav_file.name,
-                "filtered relevant dominant-only spectrum",
-                filtered_relevant_spectrum_dir / f"{wav_file.stem}_relevant_dominant_only_spectrum.svg",
-                0.0,
-                relevant_max_frequency_hz,
-                filtered_relevant_useful_range,
-                float(filtered_relevant_analysis["global_dominant_frequency_hz"]),
-                args.recommended_min_frequency_hz,
-                filtered_relevant_spectrum_zoom_created,
-                True,
-            )
-        )
-        write_frequency_time_svg_from_samples(
-            filtered_relevant_samples,
-            sample_rate,
-            filtered_relevant_wav.name,
-            filtered_relevant_frequency_time_dir / f"{wav_file.stem}_relevant_dominant_only_frequency_time.svg",
-            args.spectrogram_fft_size,
-            relevant_max_frequency_hz,
-            "relevant dominant-only",
-        )
-        filtered_relevant_frequency_time_zoom_created = False
-        if args.auto_zoom and zoom_needed(float(filtered_relevant_useful_range["useful_max_frequency_hz"]), relevant_max_frequency_hz):
-            filtered_relevant_frequency_time_zoom_created = True
-            low = float(filtered_relevant_useful_range["useful_min_frequency_hz"])
-            high = float(filtered_relevant_useful_range["useful_max_frequency_hz"])
-            write_frequency_time_svg_from_samples(
-                filtered_relevant_samples,
-                sample_rate,
-                filtered_relevant_wav.name,
-                filtered_relevant_frequency_time_dir / f"{wav_file.stem}_relevant_dominant_only_frequency_time_zoomed_{hz_for_filename(low)}_{hz_for_filename(high)}Hz.svg",
-                args.spectrogram_fft_size,
-                high,
-                "relevant dominant-only",
-                True,
-            )
-        audit_rows.append(
-            audit_row(
-                wav_file.name,
-                "filtered relevant dominant-only frequency time spectrogram",
-                filtered_relevant_frequency_time_dir / f"{wav_file.stem}_relevant_dominant_only_frequency_time.svg",
-                0.0,
-                relevant_max_frequency_hz,
-                filtered_relevant_useful_range,
-                float(filtered_relevant_analysis["global_dominant_frequency_hz"]),
-                args.recommended_min_frequency_hz,
-                filtered_relevant_frequency_time_zoom_created,
-                True,
-            )
-        )
-
-    write_dominant_csv(dominant_rows, args.results_dir / "dominant_frequencies.csv")
-    write_dominant_svg(dominant_rows, args.results_dir / "dominant_frequencies.svg")
-    write_relevant_cutoffs_csv(cutoff_rows, args.results_dir / "relevant_frequency_cutoffs.csv")
-    write_filtered_audio_summary_csv(filtered_audio_rows, args.results_dir / "filtered_audio_summary.csv")
-    if args.audit_results:
-        write_results_audit_csv(audit_rows, args.results_dir / "results_audit.csv")
-        write_results_audit_md(audit_rows, args.results_dir / "results_audit.md")
-
-    print(f"Analyzed {len(wav_files)} WAV files")
-    print(f"Wrote first-window FFT CSV files to: {fft_dir}")
-    print(f"Wrote full-file average FFT CSV files to: {fft_average_dir}")
-    print(f"Wrote dominant-over-time CSV files to: {dominant_over_time_dir}")
-    print(f"Wrote dominant-over-time plots to: {dominant_over_time_svg_dir}")
-    print(f"Wrote relevant FFT CSV files to: {fft_relevant_dir}")
-    print(f"Wrote waveform plots to: {waveform_dir}")
-    print(f"Wrote average FFT spectrum plots to: {spectrum_dir}")
-    print(f"Wrote relevant average FFT spectrum plots to: {spectrum_relevant_dir}")
-    print(f"Wrote frequency-time plots to: {frequency_time_dir}")
-    print(f"Wrote relevant frequency-time plots to: {frequency_time_relevant_dir}")
-    print(f"Wrote full-spectrum dominant-only audio and plots to: {filtered_full_dir}")
-    print(f"Wrote relevant-spectrum dominant-only audio and plots to: {filtered_relevant_dir}")
-    if args.audit_results:
-        print(f"Wrote results audit to: {args.results_dir / 'results_audit.csv'}")
-        print(f"Wrote human-readable audit to: {args.results_dir / 'results_audit.md'}")
-    print(f"Wrote dominant frequency summary to: {args.results_dir}")
-
+    run_clean_analysis(args)
 
 if __name__ == "__main__":
     main()

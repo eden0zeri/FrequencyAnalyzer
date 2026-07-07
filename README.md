@@ -1,83 +1,144 @@
 # Frequency Analyzer
 
-This project analyzes WAV recordings in `Data/` using a pure-Python Fast Fourier Transform.
+Analyze WAV recordings from `Data/` and write clean, interpretable frequency-analysis outputs to `outputs/`.
 
-The input recordings are read as PCM audio, converted to normalized mono samples, and analyzed with overlapping Hann-windowed FFT frames across the whole file. For the TASCAM files currently in `Data/`, the sample rate is 48,000 Hz, meaning 48,000 samples per second per channel.
+The analyzer preserves the original WAV files. Resampling, filtering, denoising, pitch extraction, plots, and derived WAVs are written as generated outputs.
 
-## Dominant Frequency
-
-`dominant_frequency_hz` is the frequency bin with the largest average FFT magnitude across the full WAV file.
-
-In earlier versions, the dominant frequency came from only the first FFT window. That could be misleading when a recording changed over time. The current script analyzes overlapping windows from the beginning to the end of each WAV, averages the magnitude of each frequency bin, and chooses the bin with the highest mean magnitude.
-
-Magnitude is what determines which frequency is dominant. FFT output values are complex numbers, and the script uses their magnitude to measure how strongly each frequency appears.
-
-## Run
+## Quick Run
 
 ```bash
-python3 frequency.py
+python3 frequency.py --clean-outputs
 ```
 
 Useful options:
 
 ```bash
-python3 frequency.py --fft-size 8192 --hop-size 4096
-python3 frequency.py --min-frequency-hz 20
-python3 frequency.py --max-frequency-hz 2000
-python3 frequency.py --no-auto-zoom
-python3 frequency.py --no-audit-results
+python3 frequency.py --analysis-sample-rate-hz 1500 --max-frequency-hz 500 --plot-max-frequency-hz 500
+python3 frequency.py --highpass-cutoff-hz 80 --notch-frequency-hz 50 --notch-harmonics 8
+python3 frequency.py --segment-duration-seconds 2.5 --segment-overlap-seconds 0
+python3 frequency.py --export-debug-plots --export-debug-audio
+python3 frequency.py --export-csv
 ```
 
-Defaults:
+Optional Streamlit UI:
 
-- `--fft-size 8192`
-- `--hop-size fft_size // 2`
-- `--min-frequency-hz 20.0`
-- `--recommended-min-frequency-hz 50.0`
-- `--max-frequency-hz` has no upper limit unless provided
-- `--plot-max-frequency-hz 2000.0` controls the full-range plot y-axis, not the full-file dominant-frequency search
-- auto zoom and result auditing are enabled by default
+```bash
+streamlit run streamlit_app.py
+```
 
-## Outputs
+## Denoised vs Isolated Audio
 
-- `results/dominant_frequencies.csv`: full-file dominant frequency summary.
-- `results/dominant_frequencies.svg`: bar chart of full-file dominant frequencies.
-- `results/dominant_over_time/`: per-frame dominant frequency CSVs.
-- `results/dominant_over_time_svg/`: dominant frequency vs time plots.
-- `results/dominant_over_time_zoomed_svg/`: zoomed dominant frequency vs time plots.
-- `results/fft/`: first-window FFT CSVs, kept for comparison.
-- `results/fft_average/`: full-file average FFT CSVs.
-- `results/fft_relevant/`: full-file average FFT data truncated to the relevant frequency cutoff.
-- `results/waveforms/`: waveform plots.
-- `results/spectra/`: full-file average spectrum plots.
-- `results/spectra_zoomed/`: zoomed full-file average spectrum plots.
-- `results/spectra_relevant/`: relevant-frequency spectrum plots.
-- `results/spectra_relevant_zoomed/`: zoomed relevant-frequency spectrum plots.
-- `results/frequency_time/`: spectrograms.
-- `results/frequency_time_zoomed/`: zoomed spectrograms.
-- `results/frequency_time_relevant/`: relevant-frequency spectrograms.
-- `results/frequency_time_relevant_zoomed/`: zoomed relevant-frequency spectrograms.
-- `results/relevant_frequency_cutoffs.csv`: cutoff chosen for each file.
-- `results/filtered_full/`: WAVs and plots reconstructed from the full-file dominant frequency only.
-- `results/filtered_relevant/`: WAVs and plots reconstructed from the dominant frequency inside the relevant cutoff only.
-- `results/filtered_audio_summary.csv`: frequencies used for filtered WAV generation.
-- `results/results_audit.csv`: machine-readable plot and result audit.
-- `results/results_audit.md`: human-readable audit summary.
+Use these terms consistently:
 
-## Interpreting the results
+- Denoised audio removes unwanted noise while preserving as much of the original recording as possible.
+- Isolated audio extracts a target signal and may discard other parts of the original sound.
 
-A mostly dark spectrogram is not necessarily wrong. It often means the useful signal energy is concentrated in a much smaller frequency band than the full plotted y-axis. When that happens, use the matching zoomed plot. The script automatically detects useful frequency ranges and creates zoomed spectra or spectrograms when the default axis would hide the visible band.
+Default audio outputs:
 
-Dominant frequency is the frequency with the largest spectral magnitude in the selected search range. Magnitude, not the real or imaginary part alone, determines which frequency is dominant.
+- `audio/denoised_filtered.wav`: broad denoising with high-pass and notch filters.
+- `audio/isolated_pitch_band.wav`: band-limited extraction around the selected/detected non-hum pitch.
+- `audio/isolated_pitch_contour.wav`: contour-focused isolation when pitch contour extraction is enabled.
 
-Very low dominant frequencies, especially below 50 Hz, may be rumble, wind, handling noise, electrical or mechanical vibration, or real signal depending on the experiment. The program does not silently remove those frequencies; it reports them and flags them in the audit.
+`denoised_filtered.wav` should sound closest to the original recording. The isolated files are for hearing a target pitch region and may sound less natural.
 
-Filtered dominant-only WAV files should usually show a narrow horizontal band in their spectrograms. That sparse appearance is expected because those files intentionally keep only one dominant frequency.
+## Clean Default Outputs
 
-Read `results/results_audit.md` first when deciding which plots need attention. Use `results/results_audit.csv` when you want the detailed per-output audit rows.
+For each WAV, the default output folder is:
 
-## Notes
+```text
+outputs/<file_stem>/
+  waveform.png
+  spectrogram_raw.png
+  spectrogram_denoised.png
+  spectrogram_enhanced_pitch.png
+  average_spectrum_db.png
+  pitch_contour.png
+  audio/
+    denoised_filtered.wav
+    isolated_pitch_band.wav
+    isolated_pitch_contour.wav
+  segments/
+    segment_000_0.00s_2.50s/
+      waveform.png
+      spectrogram_raw.png
+      spectrogram_denoised.png
+      spectrogram_enhanced_pitch.png
+      average_spectrum_db.png
+      pitch_contour.png
+      summary.json
+  segment_averages/
+    mean_segment_spectrum_db.png
+    median_segment_spectrum_db.png
+    segment_spectrum_variability.png
+    pitch_contours_over_segments.png
+    summary.json
+  summary.json
+  summary.md
+```
 
-The filtered WAV files are intentionally extreme: they keep only one dominant frequency. They are useful for comparison and inspection, but they are not meant to sound like natural denoised audio.
+Normal users should inspect these files first. The default output avoids duplicate full/relevant/zoomed plot families, duplicate SVG/PNG pairs, and CSV clutter.
 
-The script does not require NumPy, SciPy, Matplotlib, or any other third-party package.
+## Denoising Pipeline
+
+The denoised views and denoised WAV use:
+
+- High-pass filter, default `80 Hz`, to reduce low rumble.
+- Notch filter, default `50 Hz` with harmonics, to reduce fixed electrical hum.
+- Spectral noise-floor suppression for enhanced pitch visualization.
+
+The raw spectrogram is still generated separately so you can compare the original recording against the denoised and enhanced views.
+
+The enhanced pitch spectrogram estimates a per-frequency noise floor using a percentile across time, subtracts it, converts the result to dB, and overlays a lightly smoothed non-hum pitch contour.
+
+## Debug Outputs
+
+Debug outputs are available but off by default.
+
+Use:
+
+```bash
+python3 frequency.py --export-debug-plots --export-debug-audio
+```
+
+Debug plots may include pre-filter spectra, post-filter spectra, full-range raw spectrograms, and intermediate diagnostic plots. Debug audio may include:
+
+```text
+audio/debug/highpass_only.wav
+audio/debug/notch_only.wav
+audio/debug/highpass_notch.wav
+audio/debug/dominant_sine_only.wav
+```
+
+Debug files are intentionally verbose and are only for checking whether each filter is doing what it should.
+
+## CSV Policy
+
+CSV files are not generated by default.
+
+Use:
+
+```bash
+python3 frequency.py --export-csv
+```
+
+This writes focused CSV files such as:
+
+- `csv/average_spectrum.csv`
+- `csv/segment_summary.csv`
+- `csv/pitch_peaks_over_time.csv`
+
+## Cleanup
+
+Use `--clean-outputs` to delete and regenerate the selected output directory. It only targets generated output folders.
+
+Use `--dedupe-existing-results` to remove redundant generated files according to the clean output policy. SVG files are removed when a PNG equivalent exists. CSVs are removed unless `--keep-csv` is passed.
+
+## Resampling
+
+Resampling is enabled by default and uses `scipy.signal.resample_poly`, which applies anti-alias filtering. The Nyquist limit is half the analysis sample rate. For example, `1500 Hz` analysis sample rate can represent frequencies up to `750 Hz`.
+
+Resampling affects analysis and plots only; original input WAVs are not modified.
+
+## Dependencies
+
+The analyzer uses its own FFT implementation for core spectra. Resampling and filtering require SciPy. PNG plotting requires Matplotlib.
