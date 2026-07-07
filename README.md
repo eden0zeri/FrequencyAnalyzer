@@ -78,17 +78,76 @@ outputs/<file_stem>/
 
 Normal users should inspect these files first. The default output avoids duplicate full/relevant/zoomed plot families, duplicate SVG/PNG pairs, and CSV clutter.
 
-## Denoising Pipeline
+## Filtration
 
-The denoised views and denoised WAV use:
+This program uses several kinds of filters to isolate interesting pitch contours from low-frequency noise, electrical hum, and steady background energy.
 
-- High-pass filter, default `80 Hz`, to reduce low rumble.
-- Notch filter, default `50 Hz` with harmonics, to reduce fixed electrical hum.
-- Spectral noise-floor suppression for enhanced pitch visualization.
+In this project, `dominant frequency` generally means the frequency bin that is strongest after averaging across analysis windows. That combines amplitude with persistence. A loud, steady noise can dominate even if it is not the sound we care about, because it appears in many windows and contributes consistently to the average spectrum. A brief target sound can be more interesting while still losing the full-file average contest to long-lasting hum or rumble.
 
-The raw spectrogram is still generated separately so you can compare the original recording against the denoised and enhanced views.
+That is why the analyzer separates raw, denoised, enhanced, and isolated outputs instead of trusting the raw dominant frequency alone.
 
-The enhanced pitch spectrogram estimates a per-frequency noise floor using a percentile across time, subtracts it, converts the result to dB, and overlays a lightly smoothed non-hum pitch contour.
+### High-pass filter
+
+- Default: `--highpass-cutoff-hz 80`
+- Purpose: reduce low rumble, handling noise, wind, vibration, and very low hum.
+- Type: digital Butterworth IIR high-pass filter.
+- Implementation: `scipy.signal.butter(..., btype="highpass", output="sos")`, applied with second-order-section filtering.
+
+A high-pass filter keeps frequencies above the cutoff and attenuates frequencies below it. Butterworth filters are used because they have a smooth, maximally flat passband, so they avoid ripple in the retained frequency range.
+
+### Notch filter
+
+- Default: `--notch-frequency-hz 50 --notch-harmonics 8`
+- Purpose: reduce fixed electrical/mechanical hum at `50 Hz` or `60 Hz` and harmonics such as `100`, `150`, `200 Hz`.
+- Type: narrow second-order IIR notch filter.
+- Implementation: `scipy.signal.iirnotch(...)`.
+
+A notch filter is a very narrow band-stop filter. It removes a tight frequency stripe while leaving nearby frequencies mostly intact. This matters because hum is often steady and can dominate average spectra even when it is not perceptually or scientifically interesting.
+
+### Band-pass filter
+
+- Used for: `audio/isolated_pitch_band.wav` and `audio/isolated_pitch_contour.wav`.
+- Purpose: extract a target pitch region while discarding lower and higher frequencies.
+- Type: digital Butterworth IIR band-pass filter.
+- Implementation: `scipy.signal.butter(..., btype="bandpass", output="sos")`.
+
+Band-pass filtering is more aggressive than denoising. It is an isolation tool, not a preservation tool. It can make a target frequency range easier to hear, but it may remove important surrounding sound.
+
+### Resampling anti-alias filter
+
+- Used when `--analysis-sample-rate-hz` is lower than the original WAV sample rate.
+- Purpose: safely reduce the analysis sample rate without folding high frequencies into lower frequencies.
+- Type: polyphase FIR anti-aliasing resampling filter.
+- Implementation: `scipy.signal.resample_poly`.
+
+This is not simple sample dropping. The anti-alias filter removes frequencies that cannot be represented at the lower sample rate before resampling.
+
+### Spectral noise-floor suppression
+
+- Used for: `spectrogram_enhanced_pitch.png` and pitch-contour extraction.
+- Purpose: reveal time-varying pitch contours that are hidden by steady background noise.
+- Type: STFT-domain magnitude enhancement, not a normal time-domain audio filter.
+- Implementation: compute an STFT, estimate a per-frequency noise floor using a percentile across time, subtract that floor, clip negative values to zero, convert to dB, then overlay a smoothed pitch contour.
+
+This enhanced view is for visualization and pitch extraction. It does not replace the raw spectrogram. The raw spectrogram is still generated so you can check what was actually recorded.
+
+### FFT and STFT analysis
+
+Average spectra use NumPy `numpy.fft.rfft` and `numpy.fft.rfftfreq`, which are appropriate for real-valued audio. Spectrograms use `scipy.signal.stft`, which splits audio into short overlapping windows and computes a spectrum for each time window.
+
+The key tradeoff is time resolution versus frequency resolution. Longer windows separate nearby frequencies better, while shorter windows show faster changes more clearly.
+
+### Why filtering can hide real signal
+
+Every filter is a choice. If a real signal overlaps the noise band, filtering can reduce or remove it. For example, a high-pass filter at `80 Hz` will suppress real content below `80 Hz`, and a notch at `100 Hz` can reduce real signal near `100 Hz`.
+
+For that reason, normal outputs include:
+
+- `spectrogram_raw.png`: what the recording contains before denoising.
+- `spectrogram_denoised.png`: what remains after high-pass and notch filtering.
+- `spectrogram_enhanced_pitch.png`: a visualization-focused view for pitch contours.
+
+Compare these before deciding whether a filter setting is too aggressive.
 
 ## Debug Outputs
 
